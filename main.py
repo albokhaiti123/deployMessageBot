@@ -34,7 +34,6 @@ async def post_init(app: Application) -> None:
     """Set bot commands and start background jobs."""
     await app.bot.set_my_commands([
         BotCommand("start",  "بدء استخدام البوت"),
-        BotCommand("mylink", "رابط دعوتك الخاص"),
         BotCommand("help",   "المساعدة"),
         BotCommand("admin",  "لوحة التحكم (للمشرفين)"),
         BotCommand("cancel", "إلغاء العملية الحالية"),

@@ -1,13 +1,17 @@
 """
 Broadcast service: sends a BroadcastMessage to all active users.
-Handles free vs paid messages and protect_content.
+
+Paid messages:
+  - Photo/Video → sent with has_spoiler=True (blurred) + payment button
+  - Text only   → sent with a lock notice + payment button
+  - After payment → actual content re-sent without spoiler
 """
 import asyncio
 import logging
 import datetime
 from typing import Optional
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, Forbidden
 
 from database.models import (
@@ -17,28 +21,24 @@ from database import db
 
 logger = logging.getLogger(__name__)
 
-# ─── Preview text for paid (blurred) messages ─────────────────────────────────
-PAID_PREVIEW_TEXT = (
-    "🔒 <b>محتوى مدفوع</b>\n\n"
-    "هذا المحتوى متاح بعد الدفع.\n"
-    "اضغط على زر <b>فتح المحتوى</b> للمتابعة."
-)
-
+# ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def _make_paid_keyboard(message_id: int, stars: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"🔓 فتح المحتوى ⭐ {stars} نجمة",
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"🔓 فتح المحتوى — {stars} ⭐",
             callback_data=f"pay_{message_id}"
-        )]
-    ])
+        )
+    ]])
 
 
 def _make_destruct_keyboard(view_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تم المشاهدة - احذف الرسالة", callback_data=f"viewed_{view_id}")]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تم المشاهدة — احذف الرسالة", callback_data=f"viewed_{view_id}")
+    ]])
 
+
+# ─── Sending logic ────────────────────────────────────────────────────────────
 
 async def _send_single(
     bot: Bot,
@@ -48,41 +48,68 @@ async def _send_single(
     session,
 ) -> Optional[int]:
     """
-    Sends the message to one user. Returns the sent Telegram message_id or None.
-    For paid messages that haven't been purchased, sends a teaser instead.
+    Send one message to one user.
+    Returns the Telegram message_id of what was sent, or None on failure.
     """
     protect = msg.protect_content
     sent_message = None
 
-    # ── Paid: check if user already purchased ─────────────────────────────────
-    if msg.is_paid:
-        already_paid = db.user_has_purchased(session, user_db_id, msg.id)
-        if not already_paid:
-            # Send teaser / lock notice
-            try:
+    # ── PAID: user hasn't purchased yet → send blurred teaser ─────────────────
+    if msg.is_paid and not db.user_has_purchased(session, user_db_id, msg.id):
+        pay_kb = _make_paid_keyboard(msg.id, msg.stars_price)
+        try:
+            if msg.media_type == MediaType.PHOTO and msg.media_file_id:
+                # Blurred spoiler image + pay button underneath
+                sent_message = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=msg.media_file_id,
+                    caption=(
+                        f"🔒 <b>محتوى مدفوع</b>\n\n"
+                        f"{msg.text or ''}\n\n"
+                        f"⭐ افتح المحتوى مقابل <b>{msg.stars_price} نجمة</b>"
+                    ).strip(),
+                    parse_mode="HTML",
+                    has_spoiler=True,        # ← blurred / hidden until tapped
+                    protect_content=protect,
+                    reply_markup=pay_kb,
+                )
+            elif msg.media_type == MediaType.VIDEO and msg.media_file_id:
+                sent_message = await bot.send_video(
+                    chat_id=chat_id,
+                    video=msg.media_file_id,
+                    caption=(
+                        f"🔒 <b>محتوى مدفوع</b>\n\n"
+                        f"{msg.text or ''}\n\n"
+                        f"⭐ افتح المحتوى مقابل <b>{msg.stars_price} نجمة</b>"
+                    ).strip(),
+                    parse_mode="HTML",
+                    has_spoiler=True,        # ← blurred video thumbnail
+                    protect_content=protect,
+                    reply_markup=pay_kb,
+                )
+            else:
+                # Text-only paid teaser
                 sent_message = await bot.send_message(
                     chat_id=chat_id,
-                    text=PAID_PREVIEW_TEXT,
+                    text=(
+                        f"🔒 <b>محتوى مدفوع</b>\n\n"
+                        f"{msg.text[:200] + '...' if msg.text and len(msg.text) > 200 else (msg.text or '')}\n\n"
+                        f"⭐ افتح المحتوى مقابل <b>{msg.stars_price} نجمة</b>"
+                    ).strip(),
                     parse_mode="HTML",
                     protect_content=protect,
-                    reply_markup=_make_paid_keyboard(msg.id, msg.stars_price),
+                    reply_markup=pay_kb,
                 )
-            except (TelegramError, Forbidden) as e:
-                logger.warning(f"Cannot send to {chat_id}: {e}")
-                return None
-            return sent_message.message_id
+        except (TelegramError, Forbidden) as e:
+            logger.warning(f"Cannot send paid teaser to {chat_id}: {e}")
+            return None
+        return sent_message.message_id if sent_message else None
 
-    # ── Determine reply markup ─────────────────────────────────────────────────
-    reply_markup = None
-    if msg.destruct_mode == DestructMode.IMMEDIATE:
-        # We'll attach a "viewed" button; actual view_id set after saving record
-        # We'll update keyboard after recording
-        pass
+    # ── FREE (or already paid) → send actual content ───────────────────────────
+    reply_markup = None   # filled below for immediate destruct
 
-    # ── Send based on media type ───────────────────────────────────────────────
     try:
         if msg.media_type == MediaType.NONE or not msg.media_file_id:
-            # Text only
             sent_message = await bot.send_message(
                 chat_id=chat_id,
                 text=msg.text or "—",
@@ -127,7 +154,7 @@ async def _send_single(
                 reply_markup=reply_markup,
             )
     except (TelegramError, Forbidden) as e:
-        logger.warning(f"Cannot send to {chat_id}: {e}")
+        logger.warning(f"Cannot send content to {chat_id}: {e}")
         return None
 
     if not sent_message:
@@ -135,10 +162,10 @@ async def _send_single(
 
     sent_msg_id = sent_message.message_id
 
-    # ── Record view ────────────────────────────────────────────────────────────
+    # Record view
     view = db.record_view(session, user_db_id, msg.id, sent_msg_id)
 
-    # ── Attach "viewed" button for IMMEDIATE destruct ──────────────────────────
+    # Attach "viewed" button for IMMEDIATE self-destruct
     if msg.destruct_mode == DestructMode.IMMEDIATE:
         try:
             await bot.edit_message_reply_markup(
@@ -152,34 +179,38 @@ async def _send_single(
     return sent_msg_id
 
 
+# ─── Public: broadcast to all users ──────────────────────────────────────────
+
 async def broadcast(bot: Bot, message_id: int) -> dict:
-    """
-    Broadcast a BroadcastMessage to all active users.
-    Returns stats dict: {total, success, failed}.
-    """
+    """Broadcast to all active subscribers. Returns stats dict."""
     with get_session() as session:
         msg = db.get_message_by_id(session, message_id)
         if not msg:
             return {"error": "Message not found"}
 
         users = db.get_all_active_users(session)
-        total = len(users)
-        success = 0
-        failed = 0
 
-        for user in users:
+    total = len(users)
+    success = 0
+    failed = 0
+
+    # Re-open session per-user to avoid long transactions
+    for user in users:
+        with get_session() as session:
             result = await _send_single(bot, user.telegram_id, msg, user.id, session)
-            if result is not None:
-                success += 1
-            else:
-                failed += 1
-            # Rate limit: max ~30 messages/sec to group of users
-            await asyncio.sleep(0.05)
+        if result is not None:
+            success += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)   # ~20 msg/sec, safe under Telegram limits
 
+    with get_session() as session:
         db.update_message_status(session, message_id, MessageStatus.SENT)
 
-        return {"total": total, "success": success, "failed": failed}
+    return {"total": total, "success": success, "failed": failed}
 
+
+# ─── Public: deliver paid content after payment ───────────────────────────────
 
 async def send_paid_content_to_user(
     bot: Bot,
@@ -187,41 +218,37 @@ async def send_paid_content_to_user(
     user_db_id: int,
     message_id: int,
 ) -> bool:
-    """
-    Sends the actual paid content to a user after successful payment.
-    """
+    """Send the real (unlocked) content to a user who just paid."""
     with get_session() as session:
         msg = db.get_message_by_id(session, message_id)
         if not msg:
             return False
         sent_id = await _send_single(bot, chat_id, msg, user_db_id, session)
-        return sent_id is not None
+    return sent_id is not None
 
+
+# ─── Scheduled cleanup: delete time-expired messages ─────────────────────────
 
 async def delete_expired_messages(bot: Bot):
-    """
-    Called periodically by scheduler. Deletes messages past their destruct time.
-    """
     now = datetime.datetime.utcnow()
     with get_session() as session:
         views = db.get_pending_deletions(session, now)
         for view in views:
             msg = view.message
-            should_delete = False
-
             if msg.destruct_mode == DestructMode.AFTER_TIME:
                 deadline = view.viewed_at + datetime.timedelta(seconds=msg.destruct_seconds)
-                if now >= deadline:
-                    should_delete = True
-            # IMMEDIATE is handled via callback button in _send_single
+                if now < deadline:
+                    continue
+            # Skip IMMEDIATE — those are handled by the "viewed" callback button
+            if msg.destruct_mode == DestructMode.IMMEDIATE:
+                continue
 
-            if should_delete:
-                user = view.user
-                try:
-                    await bot.delete_message(
-                        chat_id=user.telegram_id,
-                        message_id=view.sent_msg_id,
-                    )
-                except TelegramError as e:
-                    logger.debug(f"Could not delete message: {e}")
-                db.mark_view_deleted(session, view.id)
+            user = view.user
+            try:
+                await bot.delete_message(
+                    chat_id=user.telegram_id,
+                    message_id=view.sent_msg_id,
+                )
+            except TelegramError as e:
+                logger.debug(f"Delete expired msg failed: {e}")
+            db.mark_view_deleted(session, view.id)

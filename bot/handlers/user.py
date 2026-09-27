@@ -1,23 +1,31 @@
 """
-User-facing handlers: /start, /mylink, /help, subscription check.
+User-facing handlers: /start, /help.
+- Welcome message is fully configurable by admin from the control panel.
+- No invite links exposed to users (admin-only).
+- Users only see broadcast messages — no extra buttons or menus.
 """
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 
 import config
 from database.models import get_session
 from database import db
-from bot.services import referral as ref_service
 
 logger = logging.getLogger(__name__)
 
-
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _is_banned(session, telegram_id: int) -> bool:
-    user = db.get_user_by_telegram_id(session, telegram_id)
-    return user is not None and user.is_banned
+def _get_welcome_config(session) -> tuple[bool, str]:
+    """Returns (welcome_enabled, welcome_text)."""
+    enabled_raw = db.get_setting(session, "welcome_enabled", "true")
+    enabled = enabled_raw.lower() == "true"
+    text = db.get_setting(
+        session,
+        "welcome_text",
+        "👋 أهلاً <b>{name}</b>!\n\n🎉 لقد انضممت بنجاح.\nسيتم إرسال المحتوى إليك مباشرة هنا.",
+    )
+    return enabled, text
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -27,15 +35,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     start_param = args[0] if args else ""
 
-    # Resolve referral
+    # Resolve referral token (only admin-generated links work)
     referrer_id = None
-    if start_param:
-        token = ref_service.parse_referral_token(start_param)
-        if token:
-            referrer_id = ref_service.resolve_referrer(token)
+    if start_param and start_param.startswith("ref_"):
+        token = start_param[4:]
+        from bot.services.referral import resolve_referrer
+        referrer_id = resolve_referrer(token)
 
     with get_session() as session:
-        if _is_banned(session, user.id):
+        db_user = db.get_user_by_telegram_id(session, user.id)
+        if db_user and db_user.is_banned:
             await update.message.reply_text("🚫 أنت محظور من استخدام هذا البوت.")
             return
 
@@ -47,107 +56,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             referred_by=referrer_id,
         )
 
+        # Read welcome config
+        welcome_enabled, welcome_text = _get_welcome_config(session)
+
     if created:
-        # Notify admin about new subscriber
-        for admin_id in config.ADMIN_IDS:
+        # Notify all admins about new subscriber
+        for admin_id in config.get_all_admin_ids():
             try:
+                via = f"عبر رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=(
                         f"📥 <b>مشترك جديد!</b>\n"
-                        f"👤 الاسم: {user.full_name}\n"
+                        f"👤 الاسم: {user.full_name or '—'}\n"
                         f"🆔 المعرف: <code>{user.id}</code>\n"
-                        f"📎 عبر دعوة: {'نعم' if referrer_id else 'لا'}"
+                        f"📎 انضم: {via}"
                     ),
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
 
-    welcome_text = (
-        f"👋 أهلاً <b>{user.first_name}</b>!\n\n"
-        "🎉 لقد انضممت بنجاح إلى القناة الخاصة.\n"
-        "سيتم إرسال المحتوى الحصري إليك مباشرة هنا.\n\n"
-        "📌 يمكنك الحصول على رابط دعوتك الخاص بالأمر /mylink"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 رابط الدعوة الخاص بي", callback_data="get_my_link")],
-        [InlineKeyboardButton("❓ مساعدة", callback_data="help")],
-    ])
-
-    await update.message.reply_text(welcome_text, parse_mode="HTML", reply_markup=keyboard)
-
-
-# ─── /mylink ──────────────────────────────────────────────────────────────────
-
-async def my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    with get_session() as session:
-        if _is_banned(session, user.id):
-            await update.message.reply_text("🚫 أنت محظور.")
-            return
-        referral_count = db.get_referral_count(session, user.id)
-
-    token = ref_service.get_or_create_user_invite(user.id)
-    invite_url = ref_service.build_invite_url(token)
-
-    await update.message.reply_text(
-        f"🔗 <b>رابط دعوتك الخاص:</b>\n"
-        f"<code>{invite_url}</code>\n\n"
-        f"👥 عدد من دعوتهم: <b>{referral_count}</b>\n\n"
-        "📤 شارك هذا الرابط مع أصدقائك!",
-        parse_mode="HTML",
-    )
+    # Send welcome message only if enabled
+    if welcome_enabled:
+        formatted = welcome_text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+        await update.message.reply_text(formatted, parse_mode="HTML")
 
 
 # ─── /help ────────────────────────────────────────────────────────────────────
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    with get_session() as session:
+        db_user = db.get_user_by_telegram_id(session, user.id)
+        if db_user and db_user.is_banned:
+            return
+
+    # If user is also admin, show admin hint
+    extra = "\n\n🛠️ /admin — لوحة التحكم" if config.is_admin(user.id) else ""
     await update.message.reply_text(
-        "📖 <b>المساعدة</b>\n\n"
-        "/start - بدء استخدام البوت\n"
-        "/mylink - رابط دعوتك الخاص\n"
-        "/help - عرض هذه المساعدة\n\n"
-        "💬 ستصلك الرسائل الحصرية تلقائياً.",
+        f"📖 <b>المساعدة</b>\n\n"
+        f"/start — بدء استخدام البوت\n"
+        f"/help — هذه الرسالة"
+        f"{extra}",
         parse_mode="HTML",
     )
 
 
-# ─── Callback: get_my_link / help ─────────────────────────────────────────────
-
-async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "get_my_link":
-        user = update.effective_user
-        token = ref_service.get_or_create_user_invite(user.id)
-        invite_url = ref_service.build_invite_url(token)
-        with get_session() as session:
-            referral_count = db.get_referral_count(session, user.id)
-        await query.message.reply_text(
-            f"🔗 <b>رابط دعوتك:</b>\n<code>{invite_url}</code>\n\n"
-            f"👥 دعوت: <b>{referral_count}</b> شخص",
-            parse_mode="HTML",
-        )
-    elif data == "help":
-        await query.message.reply_text(
-            "📖 <b>المساعدة</b>\n\n"
-            "/mylink - رابط دعوتك\n"
-            "/help - هذه القائمة",
-            parse_mode="HTML",
-        )
-
-
-# ─── viewed_{view_id} callback (immediate self-destruct) ─────────────────────
+# ─── viewed_{view_id} callback (immediate self-destruct after user taps button) ─
 
 async def viewed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("🗑️ سيتم حذف الرسالة...")
+    await query.answer("🗑️ جارٍ حذف الرسالة...")
     data = query.data  # "viewed_<view_id>"
-    view_id = int(data.split("_")[1])
+    try:
+        view_id = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        return
 
     with get_session() as session:
         from database.models import MessageView
@@ -167,7 +132,5 @@ async def viewed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def register_user_handlers(app):
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mylink", my_link))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CallbackQueryHandler(user_callback, pattern="^(get_my_link|help)$"))
     app.add_handler(CallbackQueryHandler(viewed_callback, pattern=r"^viewed_\d+$"))

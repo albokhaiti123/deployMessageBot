@@ -218,3 +218,55 @@ def mark_view_deleted(session: Session, view_id: int):
     if view:
         view.deleted_at = datetime.datetime.utcnow()
         session.commit()
+
+
+# ─── BotSettings CRUD ─────────────────────────────────────────────────────────
+
+def get_setting(session: Session, key: str, default: Optional[str] = None) -> Optional[str]:
+    from database.models import BotSettings
+    row = session.query(BotSettings).filter_by(key=key).first()
+    return row.value if row else default
+
+
+def set_setting(session: Session, key: str, value: str):
+    from database.models import BotSettings
+    row = session.query(BotSettings).filter_by(key=key).first()
+    if row:
+        row.value = value
+    else:
+        row = BotSettings(key=key, value=value)
+        session.add(row)
+    session.commit()
+
+
+# ─── AdminUser CRUD ───────────────────────────────────────────────────────────
+
+def get_dynamic_admin_ids(session: Session) -> list[int]:
+    from database.models import AdminUser
+    return [a.telegram_id for a in session.query(AdminUser).all()]
+
+
+def add_admin(session: Session, telegram_id: int, added_by: int, note: str = "") -> bool:
+    from database.models import AdminUser
+    existing = session.query(AdminUser).filter_by(telegram_id=telegram_id).first()
+    if existing:
+        return False
+    session.add(AdminUser(telegram_id=telegram_id, added_by=added_by, note=note))
+    session.commit()
+    return True
+
+
+def remove_admin(session: Session, telegram_id: int) -> bool:
+    from database.models import AdminUser
+    row = session.query(AdminUser).filter_by(telegram_id=telegram_id).first()
+    if row:
+        session.delete(row)
+        session.commit()
+        return True
+    return False
+
+
+def list_admins(session: Session):
+    from database.models import AdminUser
+    return session.query(AdminUser).all()
+

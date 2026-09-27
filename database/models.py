@@ -4,7 +4,7 @@ Database models and connection setup using SQLAlchemy (sync core for simplicity)
 import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Text,
-    Boolean, DateTime, Float, ForeignKey, Enum as SAEnum
+    Boolean, DateTime, Float, ForeignKey, Enum as SAEnum, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 import enum
@@ -139,6 +139,28 @@ class InviteLink(Base):
     created_at  = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class BotSettings(Base):
+    """Key-value store for bot-wide settings (welcome message, etc.)."""
+    __tablename__ = "bot_settings"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    key         = Column(String(128), unique=True, nullable=False)
+    value       = Column(Text, nullable=True)
+    updated_at  = Column(DateTime, default=datetime.datetime.utcnow,
+                         onupdate=datetime.datetime.utcnow)
+
+
+class AdminUser(Base):
+    """Dynamic admin list (supplements the static ADMIN_IDS from .env)."""
+    __tablename__ = "admin_users"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    added_by    = Column(BigInteger, nullable=False)
+    added_at    = Column(DateTime, default=datetime.datetime.utcnow)
+    note        = Column(String(256), nullable=True)
+
+
 # ─── Init ─────────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -147,3 +169,4 @@ def init_db():
 
 def get_session():
     return SessionLocal()
+
