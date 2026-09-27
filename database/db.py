@@ -199,7 +199,7 @@ def record_view(
 
 
 def get_pending_deletions(session: Session, now: datetime.datetime) -> list[MessageView]:
-    """Get views that need their Telegram message deleted."""
+    """Get delivered messages that need auto-deletion (destruct_mode=AFTER_TIME only)."""
     from database.models import BroadcastMessage, DestructMode
     return (
         session.query(MessageView)
@@ -207,7 +207,8 @@ def get_pending_deletions(session: Session, now: datetime.datetime) -> list[Mess
         .filter(
             MessageView.deleted_at.is_(None),
             MessageView.sent_msg_id.isnot(None),
-            BroadcastMessage.destruct_mode != DestructMode.NEVER,
+            BroadcastMessage.destruct_mode == DestructMode.AFTER_TIME,
+            BroadcastMessage.destruct_seconds > 0,
         )
         .all()
     )
