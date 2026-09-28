@@ -271,3 +271,41 @@ def list_admins(session: Session):
     from database.models import AdminUser
     return session.query(AdminUser).all()
 
+
+# ─── BotGroup CRUD ────────────────────────────────────────────────────────────
+
+def upsert_group(session: Session, chat_id: int, title: str, username: Optional[str] = None):
+    """Insert or update a group record (called when bot joins a group)."""
+    import datetime
+    from database.models import BotGroup
+    row = session.query(BotGroup).filter_by(chat_id=chat_id).first()
+    if row:
+        row.title     = title
+        row.username  = username
+        row.is_active = True
+        row.last_seen = datetime.datetime.utcnow()
+    else:
+        row = BotGroup(chat_id=chat_id, title=title, username=username)
+        session.add(row)
+    session.commit()
+
+
+def deactivate_group(session: Session, chat_id: int):
+    """Mark group as inactive (called when bot is removed from a group)."""
+    from database.models import BotGroup
+    row = session.query(BotGroup).filter_by(chat_id=chat_id).first()
+    if row:
+        row.is_active = False
+        session.commit()
+
+
+def get_active_groups(session: Session):
+    """Return list of active groups as dicts."""
+    from database.models import BotGroup
+    rows = session.query(BotGroup).filter_by(is_active=True).all()
+    return [{"chat_id": r.chat_id, "title": r.title or str(r.chat_id)} for r in rows]
+
+
+def get_group_count(session: Session) -> int:
+    from database.models import BotGroup
+    return session.query(BotGroup).filter_by(is_active=True).count()

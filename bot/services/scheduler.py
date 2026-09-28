@@ -28,19 +28,21 @@ def stop_scheduler():
 
 # ─── Broadcast job ────────────────────────────────────────────────────────────
 
-async def _run_broadcast(bot, message_id: int):
+async def _run_broadcast(bot, message_id: int, target: str = "users"):
     from bot.services.broadcast import broadcast
-    logger.info(f"Running scheduled broadcast for message_id={message_id}")
-    stats = await broadcast(bot, message_id)
+    logger.info(f"Running scheduled broadcast msg={message_id} target={target}")
+    stats = await broadcast(bot, message_id, target=target)
     logger.info(f"Broadcast done: {stats}")
 
 
-def schedule_broadcast(bot, message_id: int, run_at: datetime.datetime | None = None, interval_hours: float | None = None):
-    """
-    Schedule a broadcast.
-    - run_at=None → run immediately (still via scheduler event loop)
-    - interval_hours → repeating job
-    """
+def schedule_broadcast(
+    bot,
+    message_id: int,
+    run_at: datetime.datetime | None = None,
+    interval_hours: float | None = None,
+    target: str = "users",
+):
+    """Schedule a broadcast. Supports one-shot and repeating."""
     job_id = f"broadcast_{message_id}"
 
     if interval_hours and interval_hours > 0:
@@ -48,7 +50,7 @@ def schedule_broadcast(bot, message_id: int, run_at: datetime.datetime | None = 
             _run_broadcast,
             trigger=IntervalTrigger(hours=interval_hours),
             id=job_id,
-            args=[bot, message_id],
+            args=[bot, message_id, target],
             next_run_time=run_at or datetime.datetime.utcnow(),
             replace_existing=True,
             misfire_grace_time=300,
@@ -59,11 +61,11 @@ def schedule_broadcast(bot, message_id: int, run_at: datetime.datetime | None = 
             _run_broadcast,
             trigger=DateTrigger(run_date=run_time),
             id=job_id,
-            args=[bot, message_id],
+            args=[bot, message_id, target],
             replace_existing=True,
             misfire_grace_time=300,
         )
-    logger.info(f"Scheduled broadcast job {job_id} at {run_at} (interval={interval_hours}h)")
+    logger.info(f"Scheduled job {job_id} at {run_at} interval={interval_hours}h target={target}")
 
 
 def cancel_broadcast(message_id: int):
@@ -73,7 +75,7 @@ def cancel_broadcast(message_id: int):
         logger.info(f"Cancelled job {job_id}")
 
 
-# ─── Cleanup job (delete expired messages) ───────────────────────────────────
+# ─── Cleanup job ─────────────────────────────────────────────────────────────
 
 async def _cleanup_job(bot):
     from bot.services.broadcast import delete_expired_messages
@@ -81,7 +83,6 @@ async def _cleanup_job(bot):
 
 
 def schedule_cleanup(bot):
-    """Run every 30 seconds to delete time-expired messages."""
     scheduler.add_job(
         _cleanup_job,
         trigger=IntervalTrigger(seconds=30),
@@ -92,12 +93,16 @@ def schedule_cleanup(bot):
     logger.info("Cleanup job scheduled every 30s.")
 
 
-# ─── Restore pending scheduled jobs on startup ────────────────────────────────
+# ─── Restore on startup ───────────────────────────────────────────────────────
 
 def restore_scheduled_jobs(bot):
-    """Restore SCHEDULED messages from DB on bot restart."""
     with get_session() as session:
         pending = db.get_all_messages(session, status=MessageStatus.SCHEDULED)
-        for msg in pending:
-            schedule_broadcast(bot, msg.id, run_at=msg.scheduled_at, interval_hours=msg.interval_hours)
-    logger.info(f"Restored {len(pending)} scheduled broadcast jobs.")
+        # Serialize inside session
+        jobs = [
+            {"id": m.id, "scheduled_at": m.scheduled_at, "interval_hours": m.interval_hours}
+            for m in pending
+        ]
+    for j in jobs:
+        schedule_broadcast(bot, j["id"], run_at=j["scheduled_at"], interval_hours=j["interval_hours"])
+    logger.info(f"Restored {len(jobs)} scheduled broadcast jobs.")

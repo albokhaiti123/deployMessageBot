@@ -1,18 +1,22 @@
 """
-Broadcast service — sends messages exactly as the admin created them.
+Broadcast service — raw delivery to users and/or groups.
 
-Rules:
-  • Free  → send raw, zero additions
-  • Paid  → photo/video with has_spoiler=True + original caption + pay button only
-            text/audio/doc → original text + pay button only
-  • After payment → resend without spoiler, no button
-  • Self-destruct → fully automatic; the scheduler deletes after destruct_seconds
-                    from delivery time.  No user-facing "viewed" button.
+Broadcast targets:
+  "users"  → all subscribed private-chat users
+  "groups" → all active groups the bot is in
+  "all"    → both users and groups
+
+Paid content:
+  • Photo / Video → has_spoiler=True (blurred) + original caption + pay button only
+  • Text / Audio / Document → original content + pay button only
+  • After payment → resend without spoiler, without button
+
+Self-destruct: fully automatic via scheduler (no user button).
 """
 import asyncio
 import logging
 import datetime
-from typing import Optional
+from typing import Optional, Literal
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, Forbidden
@@ -24,8 +28,10 @@ from database import db
 
 logger = logging.getLogger(__name__)
 
+BroadcastTarget = Literal["users", "groups", "all"]
 
-# ─── Payment keyboard (only addition for paid messages) ───────────────────────
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _pay_kb(message_id: int, stars: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -36,24 +42,22 @@ def _pay_kb(message_id: int, stars: int) -> InlineKeyboardMarkup:
     ]])
 
 
-# ─── Core send ────────────────────────────────────────────────────────────────
-
-async def _send_single(
+async def _send_to_chat(
     bot: Bot,
     chat_id: int,
     msg: BroadcastMessage,
-    user_db_id: int,
+    user_db_id: Optional[int],   # None for groups
     session,
     already_paid: bool = False,
 ) -> Optional[int]:
     """
-    Send one message to one user.
-    Returns the sent Telegram message_id, or None on failure.
+    Send one message to one chat (user or group).
+    Returns Telegram message_id or None on failure.
     """
     protect  = msg.protect_content
-    is_paid  = msg.is_paid and not already_paid
+    is_paid  = msg.is_paid and not already_paid and user_db_id is not None
     kb       = _pay_kb(msg.id, msg.stars_price) if is_paid else None
-    # For paid media: blur it so content stays hidden until payment
+    # Blur photo/video for unpaid messages
     spoiler  = is_paid and msg.media_type in (MediaType.PHOTO, MediaType.VIDEO)
 
     sent = None
@@ -61,7 +65,6 @@ async def _send_single(
         mtype = msg.media_type
 
         if mtype == MediaType.NONE or not msg.media_file_id:
-            # ── Plain text ───────────────────────────────────────────────────
             sent = await bot.send_message(
                 chat_id=chat_id,
                 text=msg.text or "—",
@@ -69,7 +72,6 @@ async def _send_single(
                 protect_content=protect,
                 reply_markup=kb,
             )
-
         elif mtype == MediaType.PHOTO:
             sent = await bot.send_photo(
                 chat_id=chat_id,
@@ -80,7 +82,6 @@ async def _send_single(
                 protect_content=protect,
                 reply_markup=kb,
             )
-
         elif mtype == MediaType.VIDEO:
             sent = await bot.send_video(
                 chat_id=chat_id,
@@ -91,7 +92,6 @@ async def _send_single(
                 protect_content=protect,
                 reply_markup=kb,
             )
-
         elif mtype == MediaType.AUDIO:
             sent = await bot.send_audio(
                 chat_id=chat_id,
@@ -101,7 +101,6 @@ async def _send_single(
                 protect_content=protect,
                 reply_markup=kb,
             )
-
         elif mtype == MediaType.DOCUMENT:
             sent = await bot.send_document(
                 chat_id=chat_id,
@@ -119,64 +118,88 @@ async def _send_single(
     if not sent:
         return None
 
-    # Record delivery (for self-destruct timer)
-    if msg.destruct_mode != DestructMode.NEVER and msg.destruct_seconds > 0:
+    # Record delivery for self-destruct timer (users only)
+    if user_db_id is not None and msg.destruct_mode == DestructMode.AFTER_TIME and msg.destruct_seconds > 0:
         db.record_view(session, user_db_id, msg.id, sent.message_id)
 
     return sent.message_id
 
 
-# ─── Public: broadcast to all subscribers ────────────────────────────────────
+# ─── Main broadcast ───────────────────────────────────────────────────────────
 
-async def broadcast(bot: Bot, message_id: int) -> dict:
-    """Broadcast to all active users. Returns stats."""
-    # Load message data once
+async def broadcast(
+    bot: Bot,
+    message_id: int,
+    target: BroadcastTarget = "users",
+) -> dict:
+    """
+    Broadcast message to the selected target.
+    Returns stats dict: {total, success, failed, users_total, groups_total}
+    """
     with get_session() as session:
         msg = db.get_message_by_id(session, message_id)
         if not msg:
             return {"error": "Message not found"}
-        # Detach: read all needed attributes while session is open
-        msg_id       = msg.id
-        is_paid      = msg.is_paid
-        protect      = msg.protect_content
-        media_type   = msg.media_type
-        media_fid    = msg.media_file_id
-        text         = msg.text
-        stars        = msg.stars_price
-        dest_mode    = msg.destruct_mode
-        dest_secs    = msg.destruct_seconds
 
-        users = db.get_all_active_users(session)
-        user_data = [(u.telegram_id, u.id) for u in users]
+        msg_id      = msg.id
+        is_paid     = msg.is_paid
+        dest_mode   = msg.destruct_mode
+        dest_secs   = msg.destruct_seconds
 
-    total = len(user_data)
+        users_data  = []
+        groups_data = []
+
+        if target in ("users", "all"):
+            users = db.get_all_active_users(session)
+            users_data = [(u.telegram_id, u.id) for u in users]
+
+        if target in ("groups", "all"):
+            groups_data = db.get_active_groups(session)   # list of dicts
+
+    total   = len(users_data) + len(groups_data)
     success = failed = 0
 
-    for tg_id, db_id in user_data:
+    # ── Send to users ─────────────────────────────────────────────────────────
+    for tg_id, db_id in users_data:
         with get_session() as session:
-            # Reload message inside session for ORM operations
-            msg_obj = db.get_message_by_id(session, msg_id)
-            if not msg_obj:
-                failed += 1
-                continue
-            paid_ok = is_paid and db.user_has_purchased(session, db_id, msg_id)
-            result = await _send_single(
-                bot, tg_id, msg_obj, db_id, session,
-                already_paid=paid_ok,
+            msg_obj    = db.get_message_by_id(session, msg_id)
+            paid_ok    = is_paid and db.user_has_purchased(session, db_id, msg_id)
+            result     = await _send_to_chat(
+                bot, tg_id, msg_obj, db_id, session, already_paid=paid_ok
             )
-        if result is not None:
+        if result:
             success += 1
         else:
-            failed += 1
-        await asyncio.sleep(0.05)   # ≈20 msg/sec
+            failed  += 1
+        await asyncio.sleep(0.05)
+
+    # ── Send to groups ────────────────────────────────────────────────────────
+    for g in groups_data:
+        with get_session() as session:
+            msg_obj = db.get_message_by_id(session, msg_id)
+            # Groups never have paid content gates (no user_db_id)
+            result  = await _send_to_chat(
+                bot, g["chat_id"], msg_obj, None, session, already_paid=True
+            )
+        if result:
+            success += 1
+        else:
+            failed  += 1
+        await asyncio.sleep(0.05)
 
     with get_session() as session:
         db.update_message_status(session, msg_id, MessageStatus.SENT)
 
-    return {"total": total, "success": success, "failed": failed}
+    return {
+        "total":        total,
+        "success":      success,
+        "failed":       failed,
+        "users_total":  len(users_data),
+        "groups_total": len(groups_data),
+    }
 
 
-# ─── Public: send unlocked content after payment ──────────────────────────────
+# ─── Deliver unlocked paid content after payment ──────────────────────────────
 
 async def send_paid_content_to_user(
     bot: Bot,
@@ -184,46 +207,40 @@ async def send_paid_content_to_user(
     user_db_id: int,
     message_id: int,
 ) -> bool:
-    """Send the unlocked (no spoiler, no pay button) content after payment."""
+    """Send real (no spoiler, no button) content after Stars payment."""
     with get_session() as session:
         msg = db.get_message_by_id(session, message_id)
         if not msg:
             return False
-        # already_paid=True → no spoiler, no button
-        result = await _send_single(
+        result = await _send_to_chat(
             bot, chat_id, msg, user_db_id, session, already_paid=True
         )
     return result is not None
 
 
-# ─── Scheduler: delete messages past their deadline ──────────────────────────
+# ─── Auto-delete expired messages ─────────────────────────────────────────────
 
 async def delete_expired_messages(bot: Bot):
-    """
-    Called every 30 s by the scheduler.
-    Deletes any delivered message whose deadline has passed.
-    """
+    """Called every 30s. Deletes user messages past their destruct deadline."""
     now = datetime.datetime.utcnow()
     with get_session() as session:
         views = db.get_pending_deletions(session, now)
         for view in views:
-            msg   = view.message
-            user  = view.user
+            msg  = view.message
+            user = view.user
 
-            if msg.destruct_mode == DestructMode.NEVER:
+            if msg.destruct_mode != DestructMode.AFTER_TIME:
                 continue
-
-            if msg.destruct_mode == DestructMode.AFTER_TIME:
-                deadline = view.viewed_at + datetime.timedelta(seconds=msg.destruct_seconds)
-                if now < deadline:
-                    continue
+            deadline = view.viewed_at + datetime.timedelta(seconds=msg.destruct_seconds)
+            if now < deadline:
+                continue
 
             try:
                 await bot.delete_message(
                     chat_id=user.telegram_id,
                     message_id=view.sent_msg_id,
                 )
-                logger.debug(f"Auto-deleted msg {view.sent_msg_id} for user {user.telegram_id}")
+                logger.debug(f"Auto-deleted msg {view.sent_msg_id} for {user.telegram_id}")
             except TelegramError as e:
-                logger.debug(f"Could not delete: {e}")
+                logger.debug(f"Delete failed: {e}")
             db.mark_view_deleted(session, view.id)

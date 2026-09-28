@@ -80,7 +80,12 @@ def main():
     logger.info("Starting polling...")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "pre_checkout_query"],
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "pre_checkout_query",
+            "my_chat_member",    # ← track bot join/leave groups
+        ],
     )
 
 

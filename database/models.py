@@ -139,9 +139,23 @@ class InviteLink(Base):
     created_at  = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class BotGroup(Base):
+    """Tracks groups/supergroups the bot has been added to."""
+    __tablename__ = "bot_groups"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id     = Column(BigInteger, unique=True, nullable=False, index=True)
+    title       = Column(String(256), nullable=True)
+    username    = Column(String(64), nullable=True)
+    is_active   = Column(Boolean, default=True)   # False when bot is removed
+    added_at    = Column(DateTime, default=datetime.datetime.utcnow)
+    last_seen   = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class BotSettings(Base):
     """Key-value store for bot-wide settings (welcome message, etc.)."""
     __tablename__ = "bot_settings"
+
 
     id          = Column(Integer, primary_key=True, autoincrement=True)
     key         = Column(String(128), unique=True, nullable=False)
