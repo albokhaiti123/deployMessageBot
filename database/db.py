@@ -1,6 +1,7 @@
 """
 Database helper functions (CRUD operations).
 """
+import json
 import datetime
 import secrets
 from typing import Optional
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from database.models import (
     User, BroadcastMessage, Purchase, MessageView, InviteLink,
+    WelcomeConfig, StartMessageConfig, SelfDestructJob,
     MediaType, DestructMode, MessageStatus, get_session
 )
 
@@ -21,7 +23,6 @@ def get_or_create_user(
     full_name: Optional[str] = None,
     referred_by: Optional[int] = None,
 ) -> tuple[User, bool]:
-    """Returns (user, created). Updates username/full_name on each call."""
     user = session.query(User).filter_by(telegram_id=telegram_id).first()
     created = False
     if not user:
@@ -77,6 +78,13 @@ def unban_user(session: Session, telegram_id: int) -> bool:
 
 def get_referral_count(session: Session, telegram_id: int) -> int:
     return session.query(User).filter_by(referred_by=telegram_id).count()
+
+
+def mark_start_msg_shown(session: Session, telegram_id: int):
+    user = get_user_by_telegram_id(session, telegram_id)
+    if user:
+        user.start_msg_shown = True
+        session.commit()
 
 
 # ─── Invite Link CRUD ─────────────────────────────────────────────────────────
@@ -199,7 +207,6 @@ def record_view(
 
 
 def get_pending_deletions(session: Session, now: datetime.datetime) -> list[MessageView]:
-    """Get delivered messages that need auto-deletion (destruct_mode=AFTER_TIME only)."""
     from database.models import BroadcastMessage, DestructMode
     return (
         session.query(MessageView)
@@ -275,8 +282,6 @@ def list_admins(session: Session):
 # ─── BotGroup CRUD ────────────────────────────────────────────────────────────
 
 def upsert_group(session: Session, chat_id: int, title: str, username: Optional[str] = None):
-    """Insert or update a group record (called when bot joins a group)."""
-    import datetime
     from database.models import BotGroup
     row = session.query(BotGroup).filter_by(chat_id=chat_id).first()
     if row:
@@ -291,7 +296,6 @@ def upsert_group(session: Session, chat_id: int, title: str, username: Optional[
 
 
 def deactivate_group(session: Session, chat_id: int):
-    """Mark group as inactive (called when bot is removed from a group)."""
     from database.models import BotGroup
     row = session.query(BotGroup).filter_by(chat_id=chat_id).first()
     if row:
@@ -300,7 +304,6 @@ def deactivate_group(session: Session, chat_id: int):
 
 
 def get_active_groups(session: Session):
-    """Return list of active groups as dicts."""
     from database.models import BotGroup
     rows = session.query(BotGroup).filter_by(is_active=True).all()
     return [{"chat_id": r.chat_id, "title": r.title or str(r.chat_id)} for r in rows]
@@ -309,3 +312,122 @@ def get_active_groups(session: Session):
 def get_group_count(session: Session) -> int:
     from database.models import BotGroup
     return session.query(BotGroup).filter_by(is_active=True).count()
+
+
+# ─── WelcomeConfig CRUD ──────────────────────────────────────────────────────
+
+def get_welcome_config(session: Session) -> dict:
+    """Return welcome config as a plain dict (safe outside session)."""
+    row = session.query(WelcomeConfig).first()
+    if not row:
+        return {
+            "enabled": True,
+            "text": "👋 أهلاً <b>{name}</b>!\n\n🎉 لقد انضممت بنجاح.\nستصلك الرسائل الحصرية هنا مباشرة.",
+            "media_type": "none",
+            "media_file_id": None,
+            "protect_content": False,
+            "destruct_seconds": 0,
+            "buttons": [],
+        }
+    return {
+        "enabled": row.enabled,
+        "text": row.text,
+        "media_type": row.media_type or "none",
+        "media_file_id": row.media_file_id,
+        "protect_content": row.protect_content,
+        "destruct_seconds": row.destruct_seconds or 0,
+        "buttons": json.loads(row.buttons_json or "[]"),
+    }
+
+
+def save_welcome_config(session: Session, **kwargs):
+    """Upsert welcome config. Pass only fields you want to update."""
+    row = session.query(WelcomeConfig).first()
+    if not row:
+        row = WelcomeConfig()
+        session.add(row)
+    for key, val in kwargs.items():
+        if key == "buttons":
+            row.buttons_json = json.dumps(val, ensure_ascii=False)
+        elif hasattr(row, key):
+            setattr(row, key, val)
+    session.commit()
+
+
+# ─── StartMessageConfig CRUD ─────────────────────────────────────────────────
+
+def get_start_msg_config(session: Session) -> dict:
+    """Return start-message config as a plain dict."""
+    row = session.query(StartMessageConfig).first()
+    if not row:
+        return {
+            "enabled": False,
+            "text": None,
+            "media_type": "none",
+            "media_file_id": None,
+            "is_paid": False,
+            "stars_price": 0,
+            "protect_content": False,
+            "destruct_seconds": 0,
+            "buttons": [],
+            "show_mode": "always",
+        }
+    return {
+        "enabled": row.enabled,
+        "text": row.text,
+        "media_type": row.media_type or "none",
+        "media_file_id": row.media_file_id,
+        "is_paid": row.is_paid,
+        "stars_price": row.stars_price or 0,
+        "protect_content": row.protect_content,
+        "destruct_seconds": row.destruct_seconds or 0,
+        "buttons": json.loads(row.buttons_json or "[]"),
+        "show_mode": row.show_mode or "always",
+    }
+
+
+def save_start_msg_config(session: Session, **kwargs):
+    """Upsert start-message config."""
+    row = session.query(StartMessageConfig).first()
+    if not row:
+        row = StartMessageConfig()
+        session.add(row)
+    for key, val in kwargs.items():
+        if key == "buttons":
+            row.buttons_json = json.dumps(val, ensure_ascii=False)
+        elif hasattr(row, key):
+            setattr(row, key, val)
+    session.commit()
+
+
+# ─── SelfDestructJob CRUD ────────────────────────────────────────────────────
+
+def schedule_destruct(session: Session, chat_id: int, message_id: int, seconds: int):
+    """Register a message for auto-deletion after `seconds`."""
+    if seconds <= 0:
+        return
+    delete_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)
+    job = SelfDestructJob(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
+    session.add(job)
+    session.commit()
+
+
+def get_due_destruct_jobs(session: Session, now: datetime.datetime) -> list[dict]:
+    """Return list of dicts for messages that need deletion now."""
+    rows = (
+        session.query(SelfDestructJob)
+        .filter(
+            SelfDestructJob.deleted == False,
+            SelfDestructJob.delete_at <= now,
+        )
+        .all()
+    )
+    result = [{"id": r.id, "chat_id": r.chat_id, "message_id": r.message_id} for r in rows]
+    return result
+
+
+def mark_destruct_done(session: Session, job_id: int):
+    row = session.query(SelfDestructJob).filter_by(id=job_id).first()
+    if row:
+        row.deleted = True
+        session.commit()

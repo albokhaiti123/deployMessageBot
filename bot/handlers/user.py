@@ -1,9 +1,13 @@
 """
 User-facing handlers: /start, /help.
-Also handles group join/leave events to track active groups.
+Handles group tracking and welcome vs start-message logic.
+
+Flow:
+  NEW user → /start first time → Welcome message (WelcomeConfig)
+  EXISTING user → /start again → Start message (StartMessageConfig)
 """
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     ContextTypes, CommandHandler, ChatMemberHandler
 )
@@ -11,19 +15,9 @@ from telegram.ext import (
 import config
 from database.models import get_session
 from database import db
+from bot.services.message_sender import send_configured_message
 
 logger = logging.getLogger(__name__)
-
-
-def _get_welcome_config(session) -> tuple[bool, str]:
-    enabled_raw = db.get_setting(session, "welcome_enabled", "true")
-    enabled = enabled_raw.lower() == "true"
-    text = db.get_setting(
-        session,
-        "welcome_text",
-        "👋 أهلاً <b>{name}</b>!\n\n🎉 لقد انضممت بنجاح.\nستصلك الرسائل الحصرية هنا مباشرة.",
-    )
-    return enabled, text
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -33,6 +27,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     start_param = args[0] if args else ""
 
+    # Resolve referral
     referrer_id = None
     if start_param.startswith("ref_"):
         from bot.services.referral import resolve_referrer
@@ -44,16 +39,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🚫 أنت محظور من استخدام هذا البوت.")
             return
 
-        _, created = db.get_or_create_user(
+        db_user, created = db.get_or_create_user(
             session,
             telegram_id=user.id,
             username=user.username,
             full_name=user.full_name,
             referred_by=referrer_id,
         )
-        welcome_enabled, welcome_text = _get_welcome_config(session)
+        is_new          = created
+        start_msg_shown = db_user.start_msg_shown
+        user_db_id      = db_user.id
 
-    if created:
+    if is_new:
+        # ── NEW USER: send welcome message ────────────────────────────────
+        # Notify admins
         for admin_id in config.get_all_admin_ids():
             try:
                 via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
@@ -70,13 +69,103 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    if welcome_enabled:
-        formatted = (
-            welcome_text
-            .replace("{name}", user.first_name or "")
-            .replace("{id}", str(user.id))
+        # Send welcome message
+        await _send_welcome(context.bot, user)
+
+    else:
+        # ── RETURNING USER: send start message ────────────────────────────
+        await _send_start_message(context.bot, user, user_db_id, start_msg_shown)
+
+
+async def _send_welcome(bot, user):
+    """Send the first-time welcome message based on WelcomeConfig."""
+    with get_session() as session:
+        cfg = db.get_welcome_config(session)
+
+    if not cfg["enabled"]:
+        return
+
+    text = cfg.get("text") or ""
+    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+
+    await send_configured_message(
+        bot,
+        user.id,
+        text=text,
+        media_type=cfg["media_type"],
+        media_file_id=cfg["media_file_id"],
+        protect_content=cfg["protect_content"],
+        buttons=cfg["buttons"],
+        destruct_seconds=cfg["destruct_seconds"],
+    )
+
+
+async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool):
+    """Send the returning-user /start message based on StartMessageConfig."""
+    with get_session() as session:
+        cfg = db.get_start_msg_config(session)
+
+    if not cfg["enabled"]:
+        return
+
+    # Check show_mode
+    if cfg["show_mode"] == "once_after_join" and start_msg_shown:
+        return  # already shown once
+
+    text = cfg.get("text") or ""
+    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+
+    # If paid → send invoice instead
+    if cfg["is_paid"] and cfg["stars_price"] > 0:
+        # Check if already paid
+        with get_session() as session:
+            already_paid = db.user_has_purchased(session, user_db_id, -1)  # -1 = start msg
+
+        if already_paid:
+            # Already paid, send unlocked content
+            await send_configured_message(
+                bot, user.id,
+                text=text,
+                media_type=cfg["media_type"],
+                media_file_id=cfg["media_file_id"],
+                protect_content=cfg["protect_content"],
+                buttons=cfg["buttons"],
+                destruct_seconds=cfg["destruct_seconds"],
+            )
+        else:
+            # Send blurred teaser + pay button
+            spoiler = cfg["media_type"] in ("photo", "video")
+            pay_btn = [[InlineKeyboardButton(
+                f"🔓 فتح المحتوى — {cfg['stars_price']} ⭐",
+                callback_data="pay_start_msg"
+            )]]
+            await send_configured_message(
+                bot, user.id,
+                text=text,
+                media_type=cfg["media_type"],
+                media_file_id=cfg["media_file_id"],
+                protect_content=cfg["protect_content"],
+                has_spoiler=spoiler,
+                buttons=cfg["buttons"],
+                extra_buttons=pay_btn,
+                destruct_seconds=0,  # don't destroy until paid
+            )
+    else:
+        # Free — send directly
+        await send_configured_message(
+            bot, user.id,
+            text=text,
+            media_type=cfg["media_type"],
+            media_file_id=cfg["media_file_id"],
+            protect_content=cfg["protect_content"],
+            buttons=cfg["buttons"],
+            destruct_seconds=cfg["destruct_seconds"],
         )
-        await update.message.reply_text(formatted, parse_mode="HTML")
+
+    # Mark as shown for "once_after_join" mode
+    if cfg["show_mode"] == "once_after_join":
+        with get_session() as session:
+            db.mark_start_msg_shown(session, user.id)
 
 
 # ─── /help ────────────────────────────────────────────────────────────────────
@@ -97,10 +186,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Group join/leave tracking ────────────────────────────────────────────────
 
 async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Called when the bot's membership status changes in any chat.
-    Tracks groups the bot is added to or removed from.
-    """
     result = update.my_chat_member
     if not result:
         return
@@ -120,17 +205,11 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 username=getattr(chat, "username", None),
             )
             logger.info(f"Bot joined group: {chat.title} ({chat.id})")
-
-            # Notify admins
             for admin_id in config.get_all_admin_ids():
                 try:
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=(
-                            f"➕ <b>البوت أُضيف لمجموعة!</b>\n"
-                            f"📌 {chat.title}\n"
-                            f"🆔 <code>{chat.id}</code>"
-                        ),
+                        text=f"➕ <b>البوت أُضيف لمجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -139,16 +218,11 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
         elif new_status in ("left", "kicked", "banned"):
             db.deactivate_group(session, chat.id)
             logger.info(f"Bot removed from group: {chat.title} ({chat.id})")
-
             for admin_id in config.get_all_admin_ids():
                 try:
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=(
-                            f"➖ <b>البوت أُزيل من مجموعة!</b>\n"
-                            f"📌 {chat.title}\n"
-                            f"🆔 <code>{chat.id}</code>"
-                        ),
+                        text=f"➖ <b>البوت أُزيل من مجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -160,5 +234,4 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
 def register_user_handlers(app):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  help_cmd))
-    # Track when bot is added to / removed from groups
     app.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
