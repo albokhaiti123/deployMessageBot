@@ -63,6 +63,7 @@ class User(Base):
     joined_at       = Column(DateTime, default=datetime.datetime.utcnow)
     last_seen       = Column(DateTime, default=datetime.datetime.utcnow)
     start_msg_shown = Column(Boolean, default=False)   # for "once_after_join" mode
+    last_start_msg_id = Column(BigInteger, nullable=True)  # telegram msg_id of last /start reply
 
     purchases       = relationship("Purchase", back_populates="user")
     viewed_messages = relationship("MessageView", back_populates="user")

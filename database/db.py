@@ -87,6 +87,34 @@ def mark_start_msg_shown(session: Session, telegram_id: int):
         session.commit()
 
 
+def save_last_start_msg_id(session: Session, telegram_id: int, msg_id: int):
+    """Store the telegram message_id of the last /start reply for this user."""
+    user = get_user_by_telegram_id(session, telegram_id)
+    if user:
+        user.last_start_msg_id = msg_id
+        session.commit()
+
+
+def get_last_start_msg_id(session: Session, telegram_id: int) -> Optional[int]:
+    """Get the stored last /start message_id."""
+    user = get_user_by_telegram_id(session, telegram_id)
+    return user.last_start_msg_id if user else None
+
+
+def cancel_destruct_for_msg(session: Session, chat_id: int, message_id: int):
+    """Mark any pending SelfDestructJob for this specific message as done."""
+    from database.models import SelfDestructJob
+    rows = (
+        session.query(SelfDestructJob)
+        .filter_by(chat_id=chat_id, message_id=message_id, deleted=False)
+        .all()
+    )
+    for row in rows:
+        row.deleted = True
+    if rows:
+        session.commit()
+
+
 # ─── Invite Link CRUD ─────────────────────────────────────────────────────────
 
 def create_invite_link(session: Session, owner_id: int) -> InviteLink:

@@ -112,8 +112,23 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
     if cfg["show_mode"] == "once_after_join" and start_msg_shown:
         return  # already shown once
 
+    # ── Delete previous /start message if exists ──────────────────────────
+    with get_session() as session:
+        old_msg_id = db.get_last_start_msg_id(session, user.id)
+    if old_msg_id:
+        try:
+            await bot.delete_message(chat_id=user.id, message_id=old_msg_id)
+        except Exception:
+            pass  # already deleted or expired
+        # Cancel any pending self-destruct job for the old message
+        with get_session() as session:
+            db.cancel_destruct_for_msg(session, user.id, old_msg_id)
+
+    # ── Prepare text ──────────────────────────────────────────────────────
     text = cfg.get("text") or ""
     text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+
+    sent_msg_id = None
 
     # If paid → send invoice instead
     if cfg["is_paid"] and cfg["stars_price"] > 0:
@@ -122,8 +137,7 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
             already_paid = db.user_has_purchased(session, user_db_id, -1)  # -1 = start msg
 
         if already_paid:
-            # Already paid, send unlocked content
-            await send_configured_message(
+            sent_msg_id = await send_configured_message(
                 bot, user.id,
                 text=text,
                 media_type=cfg["media_type"],
@@ -139,7 +153,7 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
                 f"🔓 فتح المحتوى — {cfg['stars_price']} ⭐",
                 callback_data="pay_start_msg"
             )]]
-            await send_configured_message(
+            sent_msg_id = await send_configured_message(
                 bot, user.id,
                 text=text,
                 media_type=cfg["media_type"],
@@ -152,7 +166,7 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
             )
     else:
         # Free — send directly
-        await send_configured_message(
+        sent_msg_id = await send_configured_message(
             bot, user.id,
             text=text,
             media_type=cfg["media_type"],
@@ -161,6 +175,11 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
             buttons=cfg["buttons"],
             destruct_seconds=cfg["destruct_seconds"],
         )
+
+    # ── Save new message ID for next deletion ─────────────────────────────
+    if sent_msg_id:
+        with get_session() as session:
+            db.save_last_start_msg_id(session, user.id, sent_msg_id)
 
     # Mark as shown for "once_after_join" mode
     if cfg["show_mode"] == "once_after_join":
