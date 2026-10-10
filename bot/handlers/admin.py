@@ -61,6 +61,10 @@ def admin_only(func):
 # ─── Shared keyboards ────────────────────────────────────────────────────────
 
 def _menu_kb():
+    # Check notification setting
+    with get_session() as session:
+        notif = db.get_setting(session, "notify_new_user", "true")
+    notif_icon = "🔔" if notif == "true" else "🔕"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📨 إنشاء رسالة بث",    callback_data="m_new")],
         [InlineKeyboardButton("📋 إدارة الرسائل",      callback_data="m_manage")],
@@ -69,6 +73,7 @@ def _menu_kb():
         [InlineKeyboardButton("📩 رسالة الترحيب",      callback_data="m_welcome")],
         [InlineKeyboardButton("🚀 رسالة /Start",       callback_data="m_startmsg")],
         [InlineKeyboardButton("👑 إدارة المشرفين",     callback_data="m_admins")],
+        [InlineKeyboardButton(f"{notif_icon} إشعارات الانضمام", callback_data="m_notif")],
         [InlineKeyboardButton("🚫 حظر", callback_data="m_ban"),
          InlineKeyboardButton("✅ رفع حظر", callback_data="m_unban")],
     ])
@@ -118,6 +123,18 @@ async def menu_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "m_welcome": return await _wel_panel(q)
     if d == "m_startmsg":return await _sm_panel(q)
     if d == "m_admins":  return await _admins_menu(q, context)
+    if d == "m_notif":
+        with get_session() as session:
+            current = db.get_setting(session, "notify_new_user", "true")
+            new_val = "false" if current == "true" else "true"
+            db.set_setting(session, "notify_new_user", new_val)
+        status = "🔔 مفعّلة" if new_val == "true" else "🔕 معطّلة"
+        await q.answer(f"إشعارات الانضمام: {status}", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=_menu_kb())
+        except Exception:
+            pass
+        return MENU
     if d == "m_ban":
         await q.message.reply_text("🚫 أدخل معرف المستخدم لحظره:", reply_markup=CXL)
         context.user_data["ban_action"] = "ban"

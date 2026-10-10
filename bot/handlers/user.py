@@ -52,22 +52,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_new:
         # ── NEW USER: send welcome message ────────────────────────────────
-        # Notify admins
-        for admin_id in config.get_all_admin_ids():
-            try:
-                via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"📥 <b>مشترك جديد!</b>\n"
-                        f"👤 {user.full_name or '—'}\n"
-                        f"🆔 <code>{user.id}</code>\n"
-                        f"📎 {via}"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+        # Notify admins (if enabled)
+        with get_session() as session:
+            notify_enabled = db.get_setting(session, "notify_new_user", "true") == "true"
+        if notify_enabled:
+            for admin_id in config.get_all_admin_ids():
+                try:
+                    via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"📥 <b>مشترك جديد!</b>\n"
+                            f"👤 {user.full_name or '—'}\n"
+                            f"🆔 <code>{user.id}</code>\n"
+                            f"📎 {via}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         # Send welcome message
         await _send_welcome(context.bot, user)
