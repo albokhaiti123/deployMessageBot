@@ -96,7 +96,7 @@ async def send_configured_message(
             if kb:
                 btn_msg = await bot.send_message(
                     chat_id=chat_id,
-                    text="⬆️",
+                    text="👇👇👇👇👇👇👇👇👇👇👇👇👇👇",
                     protect_content=protect_content,
                     reply_markup=kb,
                 )
