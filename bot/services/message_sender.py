@@ -92,14 +92,13 @@ async def send_configured_message(
             )
             sent_ids = [m.message_id for m in results]
 
-            # send_media_group can't attach buttons, so send them attached via reply
+            # send_media_group can't attach buttons, so send buttons separately
             if kb:
                 btn_msg = await bot.send_message(
                     chat_id=chat_id,
-                    text="\u200B",  # zero-width space (invisible)
+                    text="⬆️",
                     protect_content=protect_content,
                     reply_markup=kb,
-                    reply_to_message_id=sent_ids[-1],  # reply to last media → visually attached
                 )
                 sent_ids.append(btn_msg.message_id)
 
