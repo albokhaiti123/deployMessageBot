@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
     BAN_INPUT, ADD_ADMIN, REM_ADMIN,
     # Invite
     INVITE_MENU,
-) = range(35)
+) = range(33)
 
 
 # ─── Admin guard ──────────────────────────────────────────────────────────────
