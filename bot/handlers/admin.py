@@ -32,14 +32,14 @@ logger = logging.getLogger(__name__)
     # Manage
     MANAGE_LIST, MANAGE_DETAIL,
     # Welcome
-    WEL_PANEL, WEL_CONTENT, WEL_DESTRUCT, WEL_BTN_NAME, WEL_BTN_URL,
+    WEL_PANEL, WEL_TEXT, WEL_MEDIA, WEL_DESTRUCT, WEL_BTN_NAME, WEL_BTN_URL,
     # Start message
     SM_PANEL, SM_TEXT, SM_MEDIA, SM_DESTRUCT, SM_PRICE, SM_BTN_NAME, SM_BTN_URL,
     # Admin mgmt
     BAN_INPUT, ADD_ADMIN, REM_ADMIN,
     # Invite
     INVITE_MENU,
-) = range(33)
+) = range(34)
 
 
 # ─── Admin guard ──────────────────────────────────────────────────────────────
@@ -621,9 +621,10 @@ def _wel_kb(cfg):
     pr = "🔒" if cfg["protect_content"] else "🔓"
     ds = f"{cfg['destruct_seconds']}ث" if cfg["destruct_seconds"] > 0 else "لا"
     bn = len(cfg["buttons"])
+    mn = len(cfg.get("media_list", []))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"الحالة: {en}", callback_data="w_toggle")],
-        [InlineKeyboardButton("✏️ تعديل المحتوى", callback_data="w_content")],
+        [InlineKeyboardButton(f"✏️ تعديل المحتوى (📷{mn})", callback_data="w_content")],
         [InlineKeyboardButton(f"🔘 الأزرار ({bn})", callback_data="w_btns")],
         [InlineKeyboardButton(f"الحماية: {pr}", callback_data="w_prot")],
         [InlineKeyboardButton(f"💣 التدمير: {ds}", callback_data="w_dest")],
@@ -655,8 +656,16 @@ async def wel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["protect_content"] = not cfg["protect_content"]
             await q.message.edit_reply_markup(reply_markup=_wel_kb(cfg))
         elif d == "w_content":
-            await q.message.reply_text("📝 أرسل المحتوى الجديد (نص أو وسائط):", reply_markup=CXL)
-            return WEL_CONTENT
+            context.user_data["_wel_media"] = []
+            await q.message.reply_text(
+                "📝 <b>أرسل نص رسالة الترحيب الجديد:</b>\n\n<i>أو اضغط تخطي.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏩ تخطي", callback_data="wel_skip_text")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+                ]),
+            )
+            return WEL_TEXT
         elif d == "w_dest":
             await q.message.reply_text("💣 أدخل ثواني التدمير (0 = لا):", reply_markup=CXL)
             return WEL_DESTRUCT
@@ -664,6 +673,7 @@ async def wel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (cfg.get("text") or "معاينة").replace("{name}", "أحمد").replace("{id}", "123")
             await send_configured_message(
                 context.bot, update.effective_user.id, text=text,
+                media_list=cfg.get("media_list", []),
                 media_type=cfg["media_type"], media_file_id=cfg["media_file_id"],
                 protect_content=cfg["protect_content"], buttons=cfg["buttons"], destruct_seconds=0,
             )
@@ -703,18 +713,79 @@ async def wel_btn_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def wel_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.message
-    text = m.caption or m.text or ""
-    mt, fid = "none", None
-    if m.photo: mt, fid = "photo", m.photo[-1].file_id
-    elif m.video: mt, fid = "video", m.video.file_id
-    elif m.audio: mt, fid = "audio", m.audio.file_id
-    elif m.document: mt, fid = "document", m.document.file_id
+async def wel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: receive welcome text or skip."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        if update.callback_query.data == "wel_skip_text":
+            return await _wel_ask_media(update.callback_query.message)
+        return WEL_TEXT
     with get_session() as session:
-        db.save_welcome_config(session, text=text, media_type=mt, media_file_id=fid)
-    await m.reply_text("✅ تم التحديث.", reply_markup=_back("m_welcome"))
-    return MENU
+        db.save_welcome_config(session, text=update.message.text or "")
+    return await _wel_ask_media(update.message)
+
+
+async def _wel_ask_media(msg):
+    await msg.reply_text(
+        "📷 <b>أرسل الوسائط</b> (صور، فيديوهات، صوت، ملفات)\n\n"
+        "يمكنك إرسال <b>عدة وسائط</b> واحدة تلو الأخرى.\n"
+        "اضغط <b>✅ انتهيت</b> أو <b>⏩ تخطي</b>.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ انتهيت", callback_data="wel_media_done")],
+            [InlineKeyboardButton("⏩ تخطي (بدون وسائط)", callback_data="wel_media_skip")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+        ]),
+    )
+    return WEL_MEDIA
+
+
+@admin_only
+async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: collect media items or done/skip."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        d = update.callback_query.data
+        if d in ("wel_media_done", "wel_media_skip"):
+            ml = context.user_data.get("_wel_media", [])
+            if d == "wel_media_skip":
+                ml = []
+            with get_session() as session:
+                db.save_welcome_config(session, media_list=ml)
+            context.user_data.pop("_wel_media", None)
+            await update.callback_query.message.reply_text("✅ تم التحديث.", reply_markup=_back("m_welcome"))
+            return MENU
+        return WEL_MEDIA
+
+    m = update.message
+    item = None
+    if m.photo:
+        item = {"type": "photo", "file_id": m.photo[-1].file_id}
+    elif m.video:
+        item = {"type": "video", "file_id": m.video.file_id}
+    elif m.audio:
+        item = {"type": "audio", "file_id": m.audio.file_id}
+    elif m.document:
+        item = {"type": "document", "file_id": m.document.file_id}
+
+    if item:
+        if "_wel_media" not in context.user_data:
+            context.user_data["_wel_media"] = []
+        context.user_data["_wel_media"].append(item)
+        if m.caption:
+            with get_session() as session:
+                db.save_welcome_config(session, text=m.caption)
+        n = len(context.user_data["_wel_media"])
+        await m.reply_text(
+            f"✅ تم إضافة ({n}) وسائط. أرسل المزيد أو اضغط انتهيت.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ انتهيت", callback_data="wel_media_done")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+            ]),
+        )
+    else:
+        await m.reply_text("❌ نوع غير مدعوم.", reply_markup=CXL)
+    return WEL_MEDIA
 
 
 @admin_only
@@ -1128,7 +1199,14 @@ def register_admin_handlers(app):
                 CallbackQueryHandler(wel_btn_actions, pattern="^wb[ad]"),
                 CallbackQueryHandler(menu_dispatch, pattern="^(go_menu|m_welcome)$"),
             ] + _cxl,
-            WEL_CONTENT:   [MessageHandler(_any_media & ~filters.COMMAND, wel_content)] + _cxl,
+            WEL_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wel_text),
+                CallbackQueryHandler(wel_text, pattern="^wel_skip_text$"),
+            ] + _cxl,
+            WEL_MEDIA: [
+                MessageHandler(_any_media & ~filters.COMMAND, wel_media),
+                CallbackQueryHandler(wel_media, pattern="^wel_media_"),
+            ] + _cxl,
             WEL_DESTRUCT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, wel_destruct)] + _cxl,
             WEL_BTN_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, wel_btn_name)] + _cxl,
             WEL_BTN_URL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, wel_btn_url)] + _cxl,

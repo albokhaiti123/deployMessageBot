@@ -195,8 +195,9 @@ class WelcomeConfig(Base):
     id              = Column(Integer, primary_key=True, autoincrement=True)
     enabled         = Column(Boolean, default=True)
     text            = Column(Text, nullable=True)
-    media_type      = Column(String(32), default="none")
-    media_file_id   = Column(String(256), nullable=True)
+    media_type      = Column(String(32), default="none")       # legacy single
+    media_file_id   = Column(String(256), nullable=True)        # legacy single
+    media_json      = Column(Text, default="[]")                # [{"type":"photo","file_id":"..."}]
     protect_content = Column(Boolean, default=False)
     destruct_seconds= Column(Integer, default=0)
     buttons_json    = Column(Text, default="[]")

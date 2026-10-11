@@ -97,6 +97,7 @@ async def _send_welcome(bot, user):
         text=text,
         media_type=cfg["media_type"],
         media_file_id=cfg["media_file_id"],
+        media_list=cfg.get("media_list", []),
         protect_content=cfg["protect_content"],
         buttons=cfg["buttons"],
         destruct_seconds=cfg["destruct_seconds"],
