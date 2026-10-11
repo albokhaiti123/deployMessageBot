@@ -67,10 +67,10 @@ async def send_configured_message(
     buttons: Optional[list[dict]] = None,
     extra_buttons: Optional[list[list[InlineKeyboardButton]]] = None,
     destruct_seconds: int = 0,
-) -> Optional[int]:
+) -> list[int]:
     """
     Send a message and optionally schedule self-destruct.
-    Returns the Telegram message_id of the LAST sent message, or None on failure.
+    Returns list of ALL Telegram message_ids sent, or empty list on failure.
     
     Priority: media_list (multi) > media_type+media_file_id (single) > text only
     """
@@ -133,10 +133,10 @@ async def send_configured_message(
 
     except TelegramError as e:
         logger.warning(f"send_configured_message to {chat_id} failed: {e}")
-        return None
+        return []
 
     if not sent_ids:
-        return None
+        return []
 
     # Schedule self-destruct for ALL sent messages
     if destruct_seconds > 0:
@@ -144,7 +144,7 @@ async def send_configured_message(
             for mid in sent_ids:
                 db.schedule_destruct(session, chat_id, mid, destruct_seconds)
 
-    return sent_ids[-1]  # return last message_id
+    return sent_ids
 
 
 async def _send_single_media(bot, chat_id, media_type, file_id, text, protect, spoiler, kb):

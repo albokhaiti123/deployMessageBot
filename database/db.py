@@ -87,18 +87,31 @@ def mark_start_msg_shown(session: Session, telegram_id: int):
         session.commit()
 
 
-def save_last_start_msg_id(session: Session, telegram_id: int, msg_id: int):
-    """Store the telegram message_id of the last /start reply for this user."""
+def save_last_start_msg_ids(session: Session, telegram_id: int, msg_ids: list[int]):
+    """Store all telegram message_ids of the last /start reply for this user."""
     user = get_user_by_telegram_id(session, telegram_id)
     if user:
-        user.last_start_msg_id = msg_id
+        user.last_start_msg_id = json.dumps(msg_ids)
         session.commit()
 
 
-def get_last_start_msg_id(session: Session, telegram_id: int) -> Optional[int]:
-    """Get the stored last /start message_id."""
+def get_last_start_msg_ids(session: Session, telegram_id: int) -> list[int]:
+    """Get stored last /start message_ids as a list."""
     user = get_user_by_telegram_id(session, telegram_id)
-    return user.last_start_msg_id if user else None
+    if not user or not user.last_start_msg_id:
+        return []
+    raw = user.last_start_msg_id
+    # Handle both old single-int and new JSON list formats
+    if isinstance(raw, int):
+        return [raw]
+    try:
+        val = json.loads(str(raw))
+        return val if isinstance(val, list) else [int(val)]
+    except (json.JSONDecodeError, ValueError):
+        try:
+            return [int(raw)]
+        except (ValueError, TypeError):
+            return []
 
 
 def cancel_destruct_for_msg(session: Session, chat_id: int, message_id: int):
