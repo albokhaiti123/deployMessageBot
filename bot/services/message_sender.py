@@ -94,10 +94,9 @@ async def send_configured_message(
 
             # send_media_group can't attach buttons, so send buttons separately
             if kb:
-                # Braille blank (U+2800) repeated to widen message bubble → full-width buttons
                 btn_msg = await bot.send_message(
                     chat_id=chat_id,
-                    text="⠀" * 20,
+                    text="⬆️",
                     protect_content=protect_content,
                     reply_markup=kb,
                 )
