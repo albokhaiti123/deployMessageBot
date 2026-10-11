@@ -95,6 +95,7 @@ class BroadcastMessage(Base):
     created_at      = Column(DateTime, default=datetime.datetime.utcnow)
     created_by      = Column(BigInteger, nullable=False)
     buttons_json    = Column(Text, default="[]")       # [{"text":"...", "url":"..."}]
+    media_json      = Column(Text, default="[]")       # [{"type":"photo","file_id":"..."}]
 
     purchases       = relationship("Purchase", back_populates="message")
     views           = relationship("MessageView", back_populates="message")
@@ -210,8 +211,9 @@ class StartMessageConfig(Base):
     id              = Column(Integer, primary_key=True, autoincrement=True)
     enabled         = Column(Boolean, default=False)
     text            = Column(Text, nullable=True)
-    media_type      = Column(String(32), default="none")
-    media_file_id   = Column(String(256), nullable=True)
+    media_type      = Column(String(32), default="none")       # legacy single
+    media_file_id   = Column(String(256), nullable=True)        # legacy single
+    media_json      = Column(Text, default="[]")                # [{"type":"photo","file_id":"..."}]
     is_paid         = Column(Boolean, default=False)
     stars_price     = Column(Integer, default=0)
     protect_content = Column(Boolean, default=False)

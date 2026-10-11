@@ -393,6 +393,7 @@ def get_start_msg_config(session: Session) -> dict:
             "text": None,
             "media_type": "none",
             "media_file_id": None,
+            "media_list": [],
             "is_paid": False,
             "stars_price": 0,
             "protect_content": False,
@@ -400,11 +401,16 @@ def get_start_msg_config(session: Session) -> dict:
             "buttons": [],
             "show_mode": "always",
         }
+    media_list = json.loads(row.media_json or "[]")
+    # Backward compat: if media_list is empty but legacy single exists
+    if not media_list and row.media_file_id and row.media_type and row.media_type != "none":
+        media_list = [{"type": row.media_type, "file_id": row.media_file_id}]
     return {
         "enabled": row.enabled,
         "text": row.text,
         "media_type": row.media_type or "none",
         "media_file_id": row.media_file_id,
+        "media_list": media_list,
         "is_paid": row.is_paid,
         "stars_price": row.stars_price or 0,
         "protect_content": row.protect_content,
@@ -423,6 +429,15 @@ def save_start_msg_config(session: Session, **kwargs):
     for key, val in kwargs.items():
         if key == "buttons":
             row.buttons_json = json.dumps(val, ensure_ascii=False)
+        elif key == "media_list":
+            row.media_json = json.dumps(val, ensure_ascii=False)
+            # Also set legacy fields from first item
+            if val:
+                row.media_type = val[0].get("type", "none")
+                row.media_file_id = val[0].get("file_id")
+            else:
+                row.media_type = "none"
+                row.media_file_id = None
         elif hasattr(row, key):
             setattr(row, key, val)
     session.commit()

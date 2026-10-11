@@ -56,6 +56,7 @@ async def _send_single(
         text=msg_data["text"],
         media_type=msg_data["media_type"],
         media_file_id=msg_data["media_file_id"],
+        media_list=msg_data.get("media_list", []),
         protect_content=msg_data["protect_content"],
         has_spoiler=spoiler,
         buttons=buttons,
@@ -66,11 +67,16 @@ async def _send_single(
 
 def _serialize_msg(msg: BroadcastMessage) -> dict:
     """Serialize ORM object to a plain dict inside a session."""
+    media_list = json.loads(msg.media_json or "[]") if hasattr(msg, 'media_json') and msg.media_json else []
+    # Backward compat
+    if not media_list and msg.media_file_id and msg.media_type and msg.media_type != MediaType.NONE:
+        media_list = [{"type": msg.media_type.value, "file_id": msg.media_file_id}]
     return {
         "id":             msg.id,
         "text":           msg.text,
         "media_type":     msg.media_type.value if msg.media_type else "none",
         "media_file_id":  msg.media_file_id,
+        "media_list":     media_list,
         "is_paid":        msg.is_paid,
         "stars_price":    msg.stars_price or 0,
         "protect_content":msg.protect_content,

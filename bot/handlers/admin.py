@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 (
     MENU,
     # Broadcast wizard
-    BC_CONTENT, BC_PAID, BC_STARS, BC_PROTECT, BC_DESTRUCT,
+    BC_TEXT, BC_MEDIA, BC_PAID, BC_STARS, BC_PROTECT, BC_DESTRUCT,
     BC_TARGET, BC_SCHEDULE, BC_SCHEDULE_TIME, BC_INTERVAL,
     BC_BUTTONS_MENU, BC_BTN_NAME, BC_BTN_URL,
     BC_CONFIRM,
@@ -34,12 +34,12 @@ logger = logging.getLogger(__name__)
     # Welcome
     WEL_PANEL, WEL_CONTENT, WEL_DESTRUCT, WEL_BTN_NAME, WEL_BTN_URL,
     # Start message
-    SM_PANEL, SM_CONTENT, SM_DESTRUCT, SM_PRICE, SM_BTN_NAME, SM_BTN_URL,
+    SM_PANEL, SM_TEXT, SM_MEDIA, SM_DESTRUCT, SM_PRICE, SM_BTN_NAME, SM_BTN_URL,
     # Admin mgmt
     BAN_INPUT, ADD_ADMIN, REM_ADMIN,
     # Invite
     INVITE_MENU,
-) = range(31)
+) = range(35)
 
 
 # ─── Admin guard ──────────────────────────────────────────────────────────────
@@ -153,33 +153,98 @@ async def menu_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _bc_start(q, context):
-    context.user_data["bc"] = {"buttons": []}
+    context.user_data["bc"] = {"buttons": [], "media_list": []}
     await q.message.reply_text(
-        "📝 <b>أرسل محتوى الرسالة الآن</b>\n\n"
-        "يمكنك إرسال: نص، صورة، فيديو، صوت، أو مستند.\n"
-        "<i>أرسل رسالة واحدة تحتوي على كل ما تريد.</i>",
-        parse_mode="HTML", reply_markup=CXL,
+        "📝 <b>أرسل وصف/نص الرسالة:</b>\n\n"
+        "<i>أو اضغط تخطي لرسالة بدون نص.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏩ تخطي", callback_data="bc_skip_text")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+        ]),
     )
-    return BC_CONTENT
+    return BC_TEXT
 
 
 @admin_only
-async def bc_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.message
-    bc = context.user_data["bc"]
-    bc["text"] = m.caption or m.text or ""
-    if m.photo:
-        bc["media_type"], bc["file_id"] = "photo", m.photo[-1].file_id
-    elif m.video:
-        bc["media_type"], bc["file_id"] = "video", m.video.file_id
-    elif m.audio or m.voice:
-        bc["media_type"], bc["file_id"] = "audio", (m.audio or m.voice).file_id
-    elif m.document:
-        bc["media_type"], bc["file_id"] = "document", m.document.file_id
-    else:
-        bc["media_type"], bc["file_id"] = "none", None
+async def bc_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive text or skip callback."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        if update.callback_query.data == "bc_skip_text":
+            context.user_data["bc"]["text"] = ""
+            return await _bc_ask_media(update.callback_query.message)
+        return BC_TEXT
+    context.user_data["bc"]["text"] = update.message.text or ""
+    return await _bc_ask_media(update.message)
 
-    await m.reply_text(
+
+async def _bc_ask_media(msg):
+    await msg.reply_text(
+        "📷 <b>أرسل الوسائط</b> (صور، فيديوهات، صوت، ملفات)\n\n"
+        "يمكنك إرسال <b>عدة وسائط</b> واحدة تلو الأخرى.\n"
+        "اضغط <b>✅ انتهيت</b> بعد الانتهاء أو <b>⏩ تخطي</b> بدون وسائط.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ انتهيت", callback_data="bc_media_done")],
+            [InlineKeyboardButton("⏩ تخطي (بدون وسائط)", callback_data="bc_media_skip")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+        ]),
+    )
+    return BC_MEDIA
+
+
+@admin_only
+async def bc_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect media items one by one, or handle done/skip."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        d = update.callback_query.data
+        if d in ("bc_media_done", "bc_media_skip"):
+            if d == "bc_media_skip":
+                context.user_data["bc"]["media_list"] = []
+            # Set legacy fields from first item
+            ml = context.user_data["bc"]["media_list"]
+            if ml:
+                context.user_data["bc"]["media_type"] = ml[0]["type"]
+                context.user_data["bc"]["file_id"] = ml[0]["file_id"]
+            else:
+                context.user_data["bc"]["media_type"] = "none"
+                context.user_data["bc"]["file_id"] = None
+            return await _bc_ask_paid(update.callback_query.message)
+        return BC_MEDIA
+
+    m = update.message
+    item = None
+    if m.photo:
+        item = {"type": "photo", "file_id": m.photo[-1].file_id}
+    elif m.video:
+        item = {"type": "video", "file_id": m.video.file_id}
+    elif m.audio or m.voice:
+        item = {"type": "audio", "file_id": (m.audio or m.voice).file_id}
+    elif m.document:
+        item = {"type": "document", "file_id": m.document.file_id}
+
+    if item:
+        context.user_data["bc"]["media_list"].append(item)
+        # If message has caption and no text yet, use it
+        if m.caption and not context.user_data["bc"].get("text"):
+            context.user_data["bc"]["text"] = m.caption
+        n = len(context.user_data["bc"]["media_list"])
+        await m.reply_text(
+            f"✅ تم إضافة ({n}) وسائط. أرسل المزيد أو اضغط انتهيت.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ انتهيت", callback_data="bc_media_done")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+            ]),
+        )
+    else:
+        await m.reply_text("❌ نوع غير مدعوم. أرسل صورة/فيديو/صوت/مستند.", reply_markup=CXL)
+    return BC_MEDIA
+
+
+async def _bc_ask_paid(msg):
+    await msg.reply_text(
         "💵 <b>نوع الوصول</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
@@ -369,10 +434,11 @@ async def _bc_confirm(msg, context):
     sch = "🚀 فوري" if not bc.get("interval") and not bc.get("sched_at") else (
         f"🔁 كل {bc['interval']}h" if bc.get("interval") else str(bc.get("sched_at")))
     btns = len(bc.get("buttons", []))
+    media_n = len(bc.get("media_list", []))
 
     await msg.reply_text(
         f"📋 <b>مراجعة الرسالة</b>\n\n"
-        f"🎬 النوع: {bc.get('media_type', 'none')}\n"
+        f"📷 وسائط: {media_n}\n"
         f"💵 {paid}\n🔒 حماية: {'✅' if bc.get('protect') else '❌'}\n"
         f"💣 تدمير: {dest}\n📡 {tgt}\n⏰ {sch}\n🔘 أزرار: {btns}",
         parse_mode="HTML",
@@ -404,6 +470,7 @@ async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scheduled_at=bc.get("sched_at"), interval_hours=bc.get("interval"),
             status=MessageStatus.DRAFT, created_by=update.effective_user.id,
             buttons_json=json.dumps(bc.get("buttons", []), ensure_ascii=False),
+            media_json=json.dumps(bc.get("media_list", []), ensure_ascii=False),
         )
         msg_id = msg_obj.id
 
@@ -694,9 +761,10 @@ def _sm_kb(cfg):
     ds = f"{cfg['destruct_seconds']}ث" if cfg["destruct_seconds"] > 0 else "لا"
     mode = "🔁 دائماً" if cfg["show_mode"] == "always" else "1️⃣ مرة واحدة"
     bn = len(cfg["buttons"])
+    mn = len(cfg.get("media_list", []))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"الحالة: {en}", callback_data="s_toggle")],
-        [InlineKeyboardButton("✏️ تعديل المحتوى", callback_data="s_content")],
+        [InlineKeyboardButton(f"✏️ تعديل المحتوى (📷{mn})", callback_data="s_content")],
         [InlineKeyboardButton(f"النوع: {paid}", callback_data="s_paid")],
         [InlineKeyboardButton(f"🔘 الأزرار ({bn})", callback_data="s_btns")],
         [InlineKeyboardButton(f"الظهور: {mode}", callback_data="s_mode")],
@@ -743,8 +811,16 @@ async def sm_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text("⭐ أرسل السعر بالنجوم:", reply_markup=CXL)
                 return SM_PRICE
         elif d == "s_content":
-            await q.message.reply_text("📝 أرسل المحتوى الجديد:", reply_markup=CXL)
-            return SM_CONTENT
+            context.user_data["_sm_media"] = []
+            await q.message.reply_text(
+                "📝 <b>أرسل وصف المحتوى الجديد:</b>\n\n<i>أو اضغط تخطي.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏩ تخطي", callback_data="sm_skip_text")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+                ]),
+            )
+            return SM_TEXT
         elif d == "s_dest":
             await q.message.reply_text("💣 أدخل ثواني التدمير (0 = لا):", reply_markup=CXL)
             return SM_DESTRUCT
@@ -752,6 +828,7 @@ async def sm_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (cfg.get("text") or "معاينة").replace("{name}", "أحمد").replace("{id}", "123")
             await send_configured_message(
                 context.bot, update.effective_user.id, text=text,
+                media_list=cfg.get("media_list", []),
                 media_type=cfg["media_type"], media_file_id=cfg["media_file_id"],
                 protect_content=cfg["protect_content"], buttons=cfg["buttons"], destruct_seconds=0,
             )
@@ -790,18 +867,81 @@ async def sm_btn_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def sm_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.message
-    text = m.caption or m.text or ""
-    mt, fid = "none", None
-    if m.photo: mt, fid = "photo", m.photo[-1].file_id
-    elif m.video: mt, fid = "video", m.video.file_id
-    elif m.audio: mt, fid = "audio", m.audio.file_id
-    elif m.document: mt, fid = "document", m.document.file_id
+async def sm_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: receive text or skip."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        if update.callback_query.data == "sm_skip_text":
+            # Don't change existing text
+            return await _sm_ask_media(update.callback_query.message)
+        return SM_TEXT
+    # Save text
     with get_session() as session:
-        db.save_start_msg_config(session, text=text, media_type=mt, media_file_id=fid)
-    await m.reply_text("✅ تم.", reply_markup=_back("m_startmsg"))
-    return MENU
+        db.save_start_msg_config(session, text=update.message.text or "")
+    return await _sm_ask_media(update.message)
+
+
+async def _sm_ask_media(msg):
+    await msg.reply_text(
+        "📷 <b>أرسل الوسائط</b> (صور، فيديوهات، صوت، ملفات)\n\n"
+        "يمكنك إرسال <b>عدة وسائط</b> واحدة تلو الأخرى.\n"
+        "اضغط <b>✅ انتهيت</b> أو <b>⏩ تخطي</b>.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ انتهيت", callback_data="sm_media_done")],
+            [InlineKeyboardButton("⏩ تخطي (بدون وسائط)", callback_data="sm_media_skip")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+        ]),
+    )
+    return SM_MEDIA
+
+
+@admin_only
+async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: collect media items or done/skip."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        d = update.callback_query.data
+        if d in ("sm_media_done", "sm_media_skip"):
+            ml = context.user_data.get("_sm_media", [])
+            if d == "sm_media_skip":
+                ml = []
+            with get_session() as session:
+                db.save_start_msg_config(session, media_list=ml)
+            context.user_data.pop("_sm_media", None)
+            await update.callback_query.message.reply_text("✅ تم التحديث.", reply_markup=_back("m_startmsg"))
+            return MENU
+        return SM_MEDIA
+
+    m = update.message
+    item = None
+    if m.photo:
+        item = {"type": "photo", "file_id": m.photo[-1].file_id}
+    elif m.video:
+        item = {"type": "video", "file_id": m.video.file_id}
+    elif m.audio:
+        item = {"type": "audio", "file_id": m.audio.file_id}
+    elif m.document:
+        item = {"type": "document", "file_id": m.document.file_id}
+
+    if item:
+        if "_sm_media" not in context.user_data:
+            context.user_data["_sm_media"] = []
+        context.user_data["_sm_media"].append(item)
+        if m.caption:
+            with get_session() as session:
+                db.save_start_msg_config(session, text=m.caption)
+        n = len(context.user_data["_sm_media"])
+        await m.reply_text(
+            f"✅ تم إضافة ({n}) وسائط. أرسل المزيد أو اضغط انتهيت.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ انتهيت", callback_data="sm_media_done")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
+            ]),
+        )
+    else:
+        await m.reply_text("❌ نوع غير مدعوم.", reply_markup=CXL)
+    return SM_MEDIA
 
 
 @admin_only
@@ -959,7 +1099,14 @@ def register_admin_handlers(app):
                 CallbackQueryHandler(sm_btn_actions, pattern="^sb[ad]"),
             ] + _cxl,
             # Broadcast wizard
-            BC_CONTENT:       [MessageHandler(_any_media & ~filters.COMMAND, bc_content)] + _cxl,
+            BC_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bc_text),
+                CallbackQueryHandler(bc_text, pattern="^bc_skip_text$"),
+            ] + _cxl,
+            BC_MEDIA: [
+                MessageHandler(_any_media & ~filters.COMMAND, bc_media),
+                CallbackQueryHandler(bc_media, pattern="^bc_media_"),
+            ] + _cxl,
             BC_PAID:          [CallbackQueryHandler(bc_paid, pattern="^bc_")] + _cxl,
             BC_STARS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, bc_stars)] + _cxl,
             BC_PROTECT:       [CallbackQueryHandler(bc_protect, pattern="^bc_prot")] + _cxl,
@@ -976,7 +1123,7 @@ def register_admin_handlers(app):
             MANAGE_LIST:   [CallbackQueryHandler(manage_detail, pattern="^(mgr_|go_)")] + _cxl,
             MANAGE_DETAIL: [CallbackQueryHandler(manage_action, pattern="^(send_|del_|go_)")] + _cxl,
             # Welcome
-            WEL_PANEL:     [
+            WEL_PANEL: [
                 CallbackQueryHandler(wel_action, pattern="^w_"),
                 CallbackQueryHandler(wel_btn_actions, pattern="^wb[ad]"),
                 CallbackQueryHandler(menu_dispatch, pattern="^(go_menu|m_welcome)$"),
@@ -991,7 +1138,14 @@ def register_admin_handlers(app):
                 CallbackQueryHandler(sm_btn_actions, pattern="^sb[ad]"),
                 CallbackQueryHandler(menu_dispatch, pattern="^(go_menu|m_startmsg)$"),
             ] + _cxl,
-            SM_CONTENT:    [MessageHandler(_any_media & ~filters.COMMAND, sm_content)] + _cxl,
+            SM_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sm_text),
+                CallbackQueryHandler(sm_text, pattern="^sm_skip_text$"),
+            ] + _cxl,
+            SM_MEDIA: [
+                MessageHandler(_any_media & ~filters.COMMAND, sm_media),
+                CallbackQueryHandler(sm_media, pattern="^sm_media_"),
+            ] + _cxl,
             SM_DESTRUCT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sm_destruct)] + _cxl,
             SM_PRICE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, sm_price)] + _cxl,
             SM_BTN_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sm_btn_name)] + _cxl,
