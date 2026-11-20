@@ -1,21 +1,27 @@
 """
 User-facing handlers: /start, /help.
-Handles group tracking and welcome vs start-message logic.
+Handles invite-only gate, group tracking, and welcome vs start-message logic.
 
-Flow:
-  NEW user → /start first time → Welcome message (WelcomeConfig)
-  EXISTING user → /start again → Start message (StartMessageConfig)
+Phase-1 fixes:
+  - INVITE_ONLY gate: actually enforced (was dead config before)
+  - Referral: read-only lookup first, increment ONLY after confirmed new user
+  - Self-referral prevention
+  - Paid /start: sends locked teaser ONLY (no content/media/buttons leak)
+  - start_msg_shown=True only after successful content delivery
+  - html.escape() on all dynamic user/chat values in HTML templates
 """
+import html
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import (
-    ContextTypes, CommandHandler, ChatMemberHandler
-)
+from telegram import Update, InlineKeyboardButton
+from telegram.ext import ContextTypes, CommandHandler, ChatMemberHandler
 
 import config
 from database.models import get_session
 from database import db
 from bot.services.message_sender import send_configured_message
+from bot.services.referral import (
+    parse_referral_token, get_referrer_by_token, record_invite_use
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +33,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     start_param = args[0] if args else ""
 
-    # Resolve referral
-    referrer_id = None
-    if start_param.startswith("ref_"):
-        from bot.services.referral import resolve_referrer
-        referrer_id = resolve_referrer(start_param[4:])
+    # FIX: read-only lookup first (does NOT increment uses yet)
+    ref_token   = parse_referral_token(start_param)
+    referrer_id = get_referrer_by_token(ref_token) if ref_token else None
+
+    # FIX: prevent self-referral
+    if referrer_id == user.id:
+        referrer_id = None
+        ref_token   = None
 
     with get_session() as session:
         existing = db.get_user_by_telegram_id(session, user.id)
         if existing and existing.is_banned:
             await update.message.reply_text("🚫 أنت محظور من استخدام هذا البوت.")
             return
+
+        # FIX: INVITE_ONLY gate — actually enforced
+        if existing is None and config.INVITE_ONLY and not config.is_admin(user.id):
+            if referrer_id is None:
+                await update.message.reply_text(
+                    "🔒 <b>الدخول بالدعوة فقط</b>\n\n"
+                    "عذراً، الانضمام إلى هذا البوت متاح عبر رابط دعوة صالح فقط.",
+                    parse_mode="HTML",
+                )
+                return
 
         db_user, created = db.get_or_create_user(
             session,
@@ -51,19 +70,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_db_id      = db_user.id
 
     if is_new:
-        # ── NEW USER: send welcome message ────────────────────────────────
+        # FIX: increment uses ONLY for genuinely new users
+        if ref_token and referrer_id:
+            record_invite_use(ref_token)
+
         # Notify admins (if enabled)
         with get_session() as session:
             notify_enabled = db.get_setting(session, "notify_new_user", "true") == "true"
         if notify_enabled:
+            # FIX: html.escape on user name to prevent HTML injection
+            safe_name = html.escape(user.full_name or "—")
+            via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
             for admin_id in config.get_all_admin_ids():
                 try:
-                    via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
                     await context.bot.send_message(
                         chat_id=admin_id,
                         text=(
                             f"📥 <b>مشترك جديد!</b>\n"
-                            f"👤 {user.full_name or '—'}\n"
+                            f"👤 {safe_name}\n"
                             f"🆔 <code>{user.id}</code>\n"
                             f"📎 {via}"
                         ),
@@ -72,11 +96,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        # Send welcome message
         await _send_welcome(context.bot, user)
 
     else:
-        # ── RETURNING USER: send start message ────────────────────────────
         await _send_start_message(context.bot, user, user_db_id, start_msg_shown)
 
 
@@ -88,8 +110,9 @@ async def _send_welcome(bot, user):
     if not cfg["enabled"]:
         return
 
-    text = cfg.get("text") or ""
-    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+    # FIX: html.escape on name to prevent HTML injection
+    safe_first = html.escape(user.first_name or "")
+    text = (cfg.get("text") or "").replace("{name}", safe_first).replace("{id}", str(user.id))
 
     await send_configured_message(
         bot,
@@ -112,33 +135,33 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
     if not cfg["enabled"]:
         return
 
-    # Check show_mode
     if cfg["show_mode"] == "once_after_join" and start_msg_shown:
-        return  # already shown once
+        return
 
-    # ── Delete previous /start messages if exist ─────────────────────────
+    # Delete previous /start messages
     with get_session() as session:
         old_msg_ids = db.get_last_start_msg_ids(session, user.id)
     for old_id in old_msg_ids:
         try:
             await bot.delete_message(chat_id=user.id, message_id=old_id)
         except Exception:
-            pass  # already deleted or expired
-        # Cancel any pending self-destruct job for the old message
+            pass
         with get_session() as session:
             db.cancel_destruct_for_msg(session, user.id, old_id)
 
-    # ── Prepare text ──────────────────────────────────────────────────────
-    text = cfg.get("text") or ""
-    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+    # FIX: html.escape on name
+    safe_first = html.escape(user.first_name or "")
+    text = (cfg.get("text") or "").replace("{name}", safe_first).replace("{id}", str(user.id))
 
-    sent_ids = []
+    sent_ids: list[int] = []
+    content_delivered = False
 
-    # If paid → send invoice instead
     if cfg["is_paid"] and cfg["stars_price"] > 0:
-        # Check if already paid
+        # FIX: use purchase_type="start_msg" (no more -1)
         with get_session() as session:
-            already_paid = db.user_has_purchased(session, user_db_id, -1)  # -1 = start msg
+            already_paid = db.user_has_purchased(
+                session, user_db_id, purchase_type="start_msg"
+            )
 
         if already_paid:
             sent_ids = await send_configured_message(
@@ -151,27 +174,37 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
                 buttons=cfg["buttons"],
                 destruct_seconds=cfg["destruct_seconds"],
             )
+            content_delivered = bool(sent_ids)
         else:
-            # Send blurred teaser + pay button
-            spoiler = cfg["media_type"] in ("photo", "video")
+            # FIX: send ONLY locked teaser — NEVER leak paid content/media/buttons
+            media_n = len(cfg.get("media_list", []))
+            media_hint = f"\n📎 يحتوي على {media_n} وسائط مرفقة." if media_n > 0 else ""
+            teaser = (
+                f"🔒 <b>محتوى حصري مدفوع</b>{media_hint}\n\n"
+                f"هذا المحتوى مغلق ويتطلب الدفع لفتحه.\n"
+                f"⭐ السعر: <b>{cfg['stars_price']} نجمة</b>\n\n"
+                f"اضغط على الزر أدناه للدفع وفتح المحتوى."
+            )
             pay_btn = [[InlineKeyboardButton(
                 f"🔓 فتح المحتوى — {cfg['stars_price']} ⭐",
                 callback_data="pay_start_msg"
             )]]
             sent_ids = await send_configured_message(
                 bot, user.id,
-                text=text,
-                media_type=cfg["media_type"],
-                media_file_id=cfg["media_file_id"],
-                media_list=cfg.get("media_list", []),
+                text=teaser,
+                media_type="none",
+                media_file_id=None,
+                media_list=[],
                 protect_content=cfg["protect_content"],
-                has_spoiler=spoiler,
-                buttons=cfg["buttons"],
+                has_spoiler=False,
+                buttons=[],
                 extra_buttons=pay_btn,
-                destruct_seconds=0,  # don't destroy until paid
+                destruct_seconds=0,
             )
+            content_delivered = False  # user hasn't paid yet
+
     else:
-        # Free — send directly
+        # Free → deliver full content
         sent_ids = await send_configured_message(
             bot, user.id,
             text=text,
@@ -182,14 +215,14 @@ async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool)
             buttons=cfg["buttons"],
             destruct_seconds=cfg["destruct_seconds"],
         )
+        content_delivered = bool(sent_ids)
 
-    # ── Save ALL new message IDs for next deletion ────────────────────────
     if sent_ids:
         with get_session() as session:
             db.save_last_start_msg_ids(session, user.id, sent_ids)
 
-    # Mark as shown for "once_after_join" mode
-    if cfg["show_mode"] == "once_after_join":
+    # FIX: mark shown ONLY after actual content delivery succeeds
+    if content_delivered and cfg["show_mode"] == "once_after_join":
         with get_session() as session:
             db.mark_start_msg_shown(session, user.id)
 
@@ -221,6 +254,8 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     new_status = result.new_chat_member.status
+    # FIX: html.escape on chat title
+    safe_title = html.escape(chat.title or str(chat.id))
 
     with get_session() as session:
         if new_status in ("member", "administrator"):
@@ -235,7 +270,11 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"➕ <b>البوت أُضيف لمجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
+                        text=(
+                            f"➕ <b>البوت أُضيف لمجموعة!</b>\n"
+                            f"📌 {safe_title}\n"
+                            f"🆔 <code>{chat.id}</code>"
+                        ),
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -248,7 +287,11 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"➖ <b>البوت أُزيل من مجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
+                        text=(
+                            f"➖ <b>البوت أُزيل من مجموعة!</b>\n"
+                            f"📌 {safe_title}\n"
+                            f"🆔 <code>{chat.id}</code>"
+                        ),
                         parse_mode="HTML",
                     )
                 except Exception:

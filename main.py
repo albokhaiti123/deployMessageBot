@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 # ─── Post-init hook (runs after bot connects) ─────────────────────────────────
 async def post_init(app: Application) -> None:
     """Set bot commands and start background jobs."""
+    if not config.BOT_USERNAME:
+        try:
+            me = await app.bot.get_me()
+            if me.username:
+                config.BOT_USERNAME = me.username
+                logger.info(f"Auto-populated BOT_USERNAME=@{config.BOT_USERNAME}")
+        except Exception as e:
+            logger.warning(f"Could not auto-populate BOT_USERNAME: {e}")
     await app.bot.set_my_commands([
         BotCommand("start",  "بدء استخدام البوت"),
         BotCommand("help",   "المساعدة"),
@@ -67,6 +75,7 @@ def main():
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()

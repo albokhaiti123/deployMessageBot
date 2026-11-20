@@ -1,0 +1,1084 @@
+==================================================
+مستند المشروع (الجزء 3 من 3 - معالجات المستخدمين، الدفع، والخدمات):
+==================================================
+
+==================================================
+مسار الملف: bot/__init__.py
+==================================================
+
+# bot package
+
+
+
+==================================================
+مسار الملف: bot/handlers/__init__.py
+==================================================
+
+# handlers package
+
+
+
+==================================================
+مسار الملف: bot/handlers/payment.py
+==================================================
+
+"""
+Payment handler: Telegram Stars (XTR) invoice flow.
+
+Supports:
+  1. Paid broadcast messages (pay_{message_id})
+  2. Paid /start message (pay_start_msg)
+"""
+import logging
+from telegram import Update, LabeledPrice
+from telegram.ext import (
+    ContextTypes, CallbackQueryHandler,
+    PreCheckoutQueryHandler, MessageHandler, filters
+)
+
+from database.models import get_session
+from database import db
+from bot.services.broadcast import send_paid_content_to_user
+from bot.services.message_sender import send_configured_message
+import config
+
+logger = logging.getLogger(__name__)
+
+CURRENCY = "XTR"
+
+
+# ─── Step 1: User taps pay button ────────────────────────────────────────────
+
+async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    data = query.data
+
+    # ── Paid /start message ───────────────────────────────────────────────
+    if data == "pay_start_msg":
+        with get_session() as session:
+            cfg = db.get_start_msg_config(session)
+        if not cfg["is_paid"] or cfg["stars_price"] <= 0:
+            await query.message.reply_text("❌ هذا المحتوى مجاني.")
+            return
+
+        # Check if already paid
+        with get_session() as session:
+            db_user = db.get_user_by_telegram_id(session, user.id)
+            if db_user and db.user_has_purchased(session, db_user.id, -1):
+                # Re-deliver
+                text = (cfg.get("text") or "").replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+                await send_configured_message(
+                    context.bot, user.id,
+                    text=text,
+                    media_type=cfg["media_type"],
+                    media_file_id=cfg["media_file_id"],
+                    protect_content=cfg["protect_content"],
+                    buttons=cfg["buttons"],
+                    destruct_seconds=cfg["destruct_seconds"],
+                )
+                await query.message.reply_text("✅ سبق أن دفعت — تم إرسال المحتوى!")
+                return
+
+        await context.bot.send_invoice(
+            chat_id=user.id,
+            title="محتوى حصري",
+            description="🔓 اضغط على زر الدفع لفتح المحتوى.",
+            payload="paid_start_msg",
+            provider_token="",
+            currency=CURRENCY,
+            prices=[LabeledPrice(label="⭐ نجوم", amount=cfg["stars_price"])],
+            protect_content=True,
+        )
+        return
+
+    # ── Paid broadcast message ────────────────────────────────────────────
+    try:
+        message_id = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.message.reply_text("❌ طلب غير صالح.")
+        return
+
+    with get_session() as session:
+        msg = db.get_message_by_id(session, message_id)
+        if not msg:
+            await query.message.reply_text("❌ الرسالة غير موجودة.")
+            return
+        db_user = db.get_user_by_telegram_id(session, user.id)
+        if not db_user:
+            await query.message.reply_text("❌ يرجى إعادة تشغيل البوت بـ /start")
+            return
+        if db.user_has_purchased(session, db_user.id, message_id):
+            user_db_id = db_user.id
+            already = True
+        else:
+            already = False
+        stars = msg.stars_price
+        title = msg.title or "محتوى حصري"
+
+    if already:
+        await send_paid_content_to_user(context.bot, user.id, user_db_id, message_id)
+        await query.message.reply_text("✅ سبق أن دفعت — تم إرسال المحتوى!")
+        return
+
+    await context.bot.send_invoice(
+        chat_id=user.id,
+        title=title,
+        description="🔓 اضغط على زر الدفع لفتح المحتوى.",
+        payload=f"paid_msg_{message_id}",
+        provider_token="",
+        currency=CURRENCY,
+        prices=[LabeledPrice(label="⭐ نجوم", amount=stars)],
+        protect_content=True,
+    )
+
+
+# ─── Step 2: Pre-checkout ────────────────────────────────────────────────────
+
+async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.pre_checkout_query
+    payload = query.invoice_payload
+
+    if payload.startswith("paid_msg_") or payload == "paid_start_msg":
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="طلب دفع غير معروف.")
+
+
+# ─── Step 3: Successful payment ──────────────────────────────────────────────
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload
+    stars   = payment.total_amount
+    charge  = payment.telegram_payment_charge_id
+    user    = update.effective_user
+
+    # ── Start message payment ─────────────────────────────────────────────
+    if payload == "paid_start_msg":
+        with get_session() as session:
+            db_user = db.get_user_by_telegram_id(session, user.id)
+            if not db_user:
+                return
+            if not db.user_has_purchased(session, db_user.id, -1):
+                db.record_purchase(session, db_user.id, -1, stars, charge)
+
+        with get_session() as session:
+            cfg = db.get_start_msg_config(session)
+
+        await update.message.reply_text(
+            f"✅ <b>تم الدفع!</b> ⭐ {stars} نجمة\n🔓 جارٍ إرسال المحتوى...",
+            parse_mode="HTML",
+        )
+
+        text = (cfg.get("text") or "").replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+        await send_configured_message(
+            context.bot, user.id,
+            text=text,
+            media_type=cfg["media_type"],
+            media_file_id=cfg["media_file_id"],
+            protect_content=cfg["protect_content"],
+            buttons=cfg["buttons"],
+            destruct_seconds=cfg["destruct_seconds"],
+        )
+
+        # Mark shown
+        with get_session() as session:
+            db.mark_start_msg_shown(session, user.id)
+
+        # Notify admins
+        for admin_id in config.get_all_admin_ids():
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"💰 <b>دفعة /start!</b>\n👤 {user.full_name} (<code>{user.id}</code>)\n⭐ {stars}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return
+
+    # ── Broadcast message payment ─────────────────────────────────────────
+    if not payload.startswith("paid_msg_"):
+        return
+    try:
+        message_id = int(payload.split("_")[2])
+    except (IndexError, ValueError):
+        return
+
+    with get_session() as session:
+        db_user = db.get_user_by_telegram_id(session, user.id)
+        if not db_user:
+            return
+        if not db.user_has_purchased(session, db_user.id, message_id):
+            db.record_purchase(session, db_user.id, message_id, stars, charge)
+        user_db_id = db_user.id
+
+    await update.message.reply_text(
+        f"✅ <b>تم الدفع!</b> ⭐ {stars} نجمة\n🔓 جارٍ إرسال المحتوى...",
+        parse_mode="HTML",
+    )
+    await send_paid_content_to_user(context.bot, user.id, user_db_id, message_id)
+
+    for admin_id in config.get_all_admin_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"💰 <b>دفعة جديدة!</b>\n"
+                    f"👤 {user.full_name} (<code>{user.id}</code>)\n"
+                    f"⭐ {stars} نجمة\n📨 رسالة #{message_id}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+# ─── Register ─────────────────────────────────────────────────────────────────
+
+def register_payment_handlers(app):
+    app.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay_"))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+
+
+
+==================================================
+مسار الملف: bot/handlers/user.py
+==================================================
+
+"""
+User-facing handlers: /start, /help.
+Handles group tracking and welcome vs start-message logic.
+
+Flow:
+  NEW user → /start first time → Welcome message (WelcomeConfig)
+  EXISTING user → /start again → Start message (StartMessageConfig)
+"""
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    ContextTypes, CommandHandler, ChatMemberHandler
+)
+
+import config
+from database.models import get_session
+from database import db
+from bot.services.message_sender import send_configured_message
+
+logger = logging.getLogger(__name__)
+
+
+# ─── /start ───────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args or []
+    start_param = args[0] if args else ""
+
+    # Resolve referral
+    referrer_id = None
+    if start_param.startswith("ref_"):
+        from bot.services.referral import resolve_referrer
+        referrer_id = resolve_referrer(start_param[4:])
+
+    with get_session() as session:
+        existing = db.get_user_by_telegram_id(session, user.id)
+        if existing and existing.is_banned:
+            await update.message.reply_text("🚫 أنت محظور من استخدام هذا البوت.")
+            return
+
+        db_user, created = db.get_or_create_user(
+            session,
+            telegram_id=user.id,
+            username=user.username,
+            full_name=user.full_name,
+            referred_by=referrer_id,
+        )
+        is_new          = created
+        start_msg_shown = db_user.start_msg_shown
+        user_db_id      = db_user.id
+
+    if is_new:
+        # ── NEW USER: send welcome message ────────────────────────────────
+        # Notify admins (if enabled)
+        with get_session() as session:
+            notify_enabled = db.get_setting(session, "notify_new_user", "true") == "true"
+        if notify_enabled:
+            for admin_id in config.get_all_admin_ids():
+                try:
+                    via = f"رابط دعوة (مُحيل: <code>{referrer_id}</code>)" if referrer_id else "مباشر"
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"📥 <b>مشترك جديد!</b>\n"
+                            f"👤 {user.full_name or '—'}\n"
+                            f"🆔 <code>{user.id}</code>\n"
+                            f"📎 {via}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+        # Send welcome message
+        await _send_welcome(context.bot, user)
+
+    else:
+        # ── RETURNING USER: send start message ────────────────────────────
+        await _send_start_message(context.bot, user, user_db_id, start_msg_shown)
+
+
+async def _send_welcome(bot, user):
+    """Send the first-time welcome message based on WelcomeConfig."""
+    with get_session() as session:
+        cfg = db.get_welcome_config(session)
+
+    if not cfg["enabled"]:
+        return
+
+    text = cfg.get("text") or ""
+    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+
+    await send_configured_message(
+        bot,
+        user.id,
+        text=text,
+        media_type=cfg["media_type"],
+        media_file_id=cfg["media_file_id"],
+        media_list=cfg.get("media_list", []),
+        protect_content=cfg["protect_content"],
+        buttons=cfg["buttons"],
+        destruct_seconds=cfg["destruct_seconds"],
+    )
+
+
+async def _send_start_message(bot, user, user_db_id: int, start_msg_shown: bool):
+    """Send the returning-user /start message based on StartMessageConfig."""
+    with get_session() as session:
+        cfg = db.get_start_msg_config(session)
+
+    if not cfg["enabled"]:
+        return
+
+    # Check show_mode
+    if cfg["show_mode"] == "once_after_join" and start_msg_shown:
+        return  # already shown once
+
+    # ── Delete previous /start messages if exist ─────────────────────────
+    with get_session() as session:
+        old_msg_ids = db.get_last_start_msg_ids(session, user.id)
+    for old_id in old_msg_ids:
+        try:
+            await bot.delete_message(chat_id=user.id, message_id=old_id)
+        except Exception:
+            pass  # already deleted or expired
+        # Cancel any pending self-destruct job for the old message
+        with get_session() as session:
+            db.cancel_destruct_for_msg(session, user.id, old_id)
+
+    # ── Prepare text ──────────────────────────────────────────────────────
+    text = cfg.get("text") or ""
+    text = text.replace("{name}", user.first_name or "").replace("{id}", str(user.id))
+
+    sent_ids = []
+
+    # If paid → send invoice instead
+    if cfg["is_paid"] and cfg["stars_price"] > 0:
+        # Check if already paid
+        with get_session() as session:
+            already_paid = db.user_has_purchased(session, user_db_id, -1)  # -1 = start msg
+
+        if already_paid:
+            sent_ids = await send_configured_message(
+                bot, user.id,
+                text=text,
+                media_type=cfg["media_type"],
+                media_file_id=cfg["media_file_id"],
+                media_list=cfg.get("media_list", []),
+                protect_content=cfg["protect_content"],
+                buttons=cfg["buttons"],
+                destruct_seconds=cfg["destruct_seconds"],
+            )
+        else:
+            # Send blurred teaser + pay button
+            spoiler = cfg["media_type"] in ("photo", "video")
+            pay_btn = [[InlineKeyboardButton(
+                f"🔓 فتح المحتوى — {cfg['stars_price']} ⭐",
+                callback_data="pay_start_msg"
+            )]]
+            sent_ids = await send_configured_message(
+                bot, user.id,
+                text=text,
+                media_type=cfg["media_type"],
+                media_file_id=cfg["media_file_id"],
+                media_list=cfg.get("media_list", []),
+                protect_content=cfg["protect_content"],
+                has_spoiler=spoiler,
+                buttons=cfg["buttons"],
+                extra_buttons=pay_btn,
+                destruct_seconds=0,  # don't destroy until paid
+            )
+    else:
+        # Free — send directly
+        sent_ids = await send_configured_message(
+            bot, user.id,
+            text=text,
+            media_type=cfg["media_type"],
+            media_file_id=cfg["media_file_id"],
+            media_list=cfg.get("media_list", []),
+            protect_content=cfg["protect_content"],
+            buttons=cfg["buttons"],
+            destruct_seconds=cfg["destruct_seconds"],
+        )
+
+    # ── Save ALL new message IDs for next deletion ────────────────────────
+    if sent_ids:
+        with get_session() as session:
+            db.save_last_start_msg_ids(session, user.id, sent_ids)
+
+    # Mark as shown for "once_after_join" mode
+    if cfg["show_mode"] == "once_after_join":
+        with get_session() as session:
+            db.mark_start_msg_shown(session, user.id)
+
+
+# ─── /help ────────────────────────────────────────────────────────────────────
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    with get_session() as session:
+        db_user = db.get_user_by_telegram_id(session, user.id)
+        if db_user and db_user.is_banned:
+            return
+    extra = "\n\n🛠️ /admin — لوحة التحكم" if config.is_admin(user.id) else ""
+    await update.message.reply_text(
+        f"📖 <b>المساعدة</b>\n\n/start — تشغيل البوت\n/help — هذه الرسالة{extra}",
+        parse_mode="HTML",
+    )
+
+
+# ─── Group join/leave tracking ────────────────────────────────────────────────
+
+async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.my_chat_member
+    if not result:
+        return
+
+    chat = result.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    new_status = result.new_chat_member.status
+
+    with get_session() as session:
+        if new_status in ("member", "administrator"):
+            db.upsert_group(
+                session,
+                chat_id=chat.id,
+                title=chat.title or "",
+                username=getattr(chat, "username", None),
+            )
+            logger.info(f"Bot joined group: {chat.title} ({chat.id})")
+            for admin_id in config.get_all_admin_ids():
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"➕ <b>البوت أُضيف لمجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+        elif new_status in ("left", "kicked", "banned"):
+            db.deactivate_group(session, chat.id)
+            logger.info(f"Bot removed from group: {chat.title} ({chat.id})")
+            for admin_id in config.get_all_admin_ids():
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"➖ <b>البوت أُزيل من مجموعة!</b>\n📌 {chat.title}\n🆔 <code>{chat.id}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+
+# ─── Register ─────────────────────────────────────────────────────────────────
+
+def register_user_handlers(app):
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help",  help_cmd))
+    app.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+
+
+==================================================
+مسار الملف: bot/services/__init__.py
+==================================================
+
+# services package
+
+
+
+==================================================
+مسار الملف: bot/services/broadcast.py
+==================================================
+
+"""
+Broadcast service — uses the unified message_sender.
+
+Supports:
+  • Users / Groups / All targets
+  • Paid messages with spoiler + pay button
+  • URL buttons from buttons_json
+  • Self-destruct via SelfDestructJob table
+"""
+import asyncio
+import json
+import logging
+import datetime
+from typing import Optional, Literal
+
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError, Forbidden
+
+from database.models import (
+    get_session, BroadcastMessage, MediaType, DestructMode, MessageStatus
+)
+from database import db
+from bot.services.message_sender import send_configured_message
+
+logger = logging.getLogger(__name__)
+
+BroadcastTarget = Literal["users", "groups", "all"]
+
+
+def _pay_kb(message_id: int, stars: int) -> list[list[InlineKeyboardButton]]:
+    """Returns extra_buttons rows for a pay button."""
+    return [[
+        InlineKeyboardButton(
+            f"🔓 فتح المحتوى — {stars} ⭐",
+            callback_data=f"pay_{message_id}"
+        )
+    ]]
+
+
+async def _send_single(
+    bot: Bot,
+    chat_id: int,
+    msg_data: dict,
+    user_db_id: Optional[int],
+    already_paid: bool = False,
+) -> Optional[int]:
+    """Send one message to one chat using the unified sender."""
+    is_paid  = msg_data["is_paid"] and not already_paid and user_db_id is not None
+    spoiler  = is_paid and msg_data["media_type"] in ("photo", "video")
+    extra    = _pay_kb(msg_data["id"], msg_data["stars_price"]) if is_paid else None
+    buttons  = msg_data.get("buttons", [])
+
+    return await send_configured_message(
+        bot,
+        chat_id,
+        text=msg_data["text"],
+        media_type=msg_data["media_type"],
+        media_file_id=msg_data["media_file_id"],
+        media_list=msg_data.get("media_list", []),
+        protect_content=msg_data["protect_content"],
+        has_spoiler=spoiler,
+        buttons=buttons,
+        extra_buttons=extra,
+        destruct_seconds=msg_data["destruct_seconds"] if not is_paid else 0,
+    )
+
+
+def _serialize_msg(msg: BroadcastMessage) -> dict:
+    """Serialize ORM object to a plain dict inside a session."""
+    media_list = json.loads(msg.media_json or "[]") if hasattr(msg, 'media_json') and msg.media_json else []
+    # Backward compat
+    if not media_list and msg.media_file_id and msg.media_type and msg.media_type != MediaType.NONE:
+        media_list = [{"type": msg.media_type.value, "file_id": msg.media_file_id}]
+    return {
+        "id":             msg.id,
+        "text":           msg.text,
+        "media_type":     msg.media_type.value if msg.media_type else "none",
+        "media_file_id":  msg.media_file_id,
+        "media_list":     media_list,
+        "is_paid":        msg.is_paid,
+        "stars_price":    msg.stars_price or 0,
+        "protect_content":msg.protect_content,
+        "destruct_mode":  msg.destruct_mode.value if msg.destruct_mode else "never",
+        "destruct_seconds": msg.destruct_seconds or 0,
+        "buttons":        json.loads(msg.buttons_json or "[]"),
+    }
+
+
+# ─── Main broadcast ───────────────────────────────────────────────────────────
+
+async def broadcast(
+    bot: Bot,
+    message_id: int,
+    target: BroadcastTarget = "users",
+) -> dict:
+    with get_session() as session:
+        msg = db.get_message_by_id(session, message_id)
+        if not msg:
+            return {"error": "Message not found"}
+        msg_data    = _serialize_msg(msg)
+        users_data  = []
+        groups_data = []
+        if target in ("users", "all"):
+            users = db.get_all_active_users(session)
+            users_data = [(u.telegram_id, u.id) for u in users]
+        if target in ("groups", "all"):
+            groups_data = db.get_active_groups(session)
+
+    total   = len(users_data) + len(groups_data)
+    success = failed = 0
+
+    # Users
+    for tg_id, db_id in users_data:
+        paid_ok = False
+        if msg_data["is_paid"]:
+            with get_session() as session:
+                paid_ok = db.user_has_purchased(session, db_id, msg_data["id"])
+        result = await _send_single(bot, tg_id, msg_data, db_id, already_paid=paid_ok)
+        if result:
+            success += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    # Groups (no payment for groups)
+    for g in groups_data:
+        result = await _send_single(bot, g["chat_id"], msg_data, None, already_paid=True)
+        if result:
+            success += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    with get_session() as session:
+        db.update_message_status(session, message_id, MessageStatus.SENT)
+
+    return {
+        "total":        total,
+        "success":      success,
+        "failed":       failed,
+        "users_total":  len(users_data),
+        "groups_total": len(groups_data),
+    }
+
+
+# ─── Deliver unlocked paid content after payment ──────────────────────────────
+
+async def send_paid_content_to_user(
+    bot: Bot,
+    chat_id: int,
+    user_db_id: int,
+    message_id: int,
+) -> bool:
+    with get_session() as session:
+        msg = db.get_message_by_id(session, message_id)
+        if not msg:
+            return False
+        msg_data = _serialize_msg(msg)
+
+    result = await _send_single(bot, chat_id, msg_data, user_db_id, already_paid=True)
+    return result is not None
+
+
+# ─── Auto-delete expired messages (legacy broadcast views + new SelfDestructJob)
+
+async def delete_expired_messages(bot: Bot):
+    """Called every 30s by the scheduler."""
+    now = datetime.datetime.utcnow()
+
+    # NEW: SelfDestructJob table (covers welcome, start, broadcast)
+    with get_session() as session:
+        jobs = db.get_due_destruct_jobs(session, now)
+    for job in jobs:
+        try:
+            await bot.delete_message(chat_id=job["chat_id"], message_id=job["message_id"])
+            logger.debug(f"Auto-deleted msg {job['message_id']} in chat {job['chat_id']}")
+        except TelegramError as e:
+            logger.debug(f"Delete failed: {e}")
+        with get_session() as session:
+            db.mark_destruct_done(session, job["id"])
+
+    # LEGACY: MessageView-based deletions (for old broadcast messages)
+    with get_session() as session:
+        views = db.get_pending_deletions(session, now)
+        for view in views:
+            msg  = view.message
+            user = view.user
+            if msg.destruct_mode != DestructMode.AFTER_TIME:
+                continue
+            deadline = view.viewed_at + datetime.timedelta(seconds=msg.destruct_seconds)
+            if now < deadline:
+                continue
+            try:
+                await bot.delete_message(chat_id=user.telegram_id, message_id=view.sent_msg_id)
+            except TelegramError as e:
+                logger.debug(f"Legacy delete failed: {e}")
+            db.mark_view_deleted(session, view.id)
+
+
+
+==================================================
+مسار الملف: bot/services/message_sender.py
+==================================================
+
+"""
+Unified message sender — sends any configured message with:
+  • Single media or media group (multiple photos/videos)
+  • protect_content
+  • has_spoiler (for paid photo/video)
+  • URL inline buttons (from buttons_json)
+  • Self-destruct scheduling (via SelfDestructJob)
+
+Used by: welcome messages, /start messages, and broadcast.
+"""
+import json
+import logging
+from typing import Optional
+
+from telegram import (
+    Bot, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument,
+)
+from telegram.error import TelegramError
+
+from database.models import get_session
+from database import db
+
+logger = logging.getLogger(__name__)
+
+
+def _build_keyboard(
+    buttons: list[dict],
+    extra_buttons: Optional[list[list[InlineKeyboardButton]]] = None,
+) -> Optional[InlineKeyboardMarkup]:
+    rows = []
+    for btn in buttons:
+        text = btn.get("text", "")
+        url  = btn.get("url", "")
+        if text and url:
+            rows.append([InlineKeyboardButton(text=text, url=url)])
+    if extra_buttons:
+        rows.extend(extra_buttons)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _make_input_media(item: dict, caption: str = None, spoiler: bool = False):
+    """Convert a media_list item to InputMedia* for send_media_group."""
+    t   = item.get("type", "photo")
+    fid = item.get("file_id")
+    if t == "photo":
+        return InputMediaPhoto(media=fid, caption=caption, parse_mode="HTML", has_spoiler=spoiler)
+    if t == "video":
+        return InputMediaVideo(media=fid, caption=caption, parse_mode="HTML", has_spoiler=spoiler)
+    if t == "audio":
+        return InputMediaAudio(media=fid, caption=caption, parse_mode="HTML")
+    if t == "document":
+        return InputMediaDocument(media=fid, caption=caption, parse_mode="HTML")
+    return InputMediaPhoto(media=fid, caption=caption, parse_mode="HTML")
+
+
+async def send_configured_message(
+    bot: Bot,
+    chat_id: int,
+    *,
+    text: Optional[str] = None,
+    media_type: str = "none",
+    media_file_id: Optional[str] = None,
+    media_list: Optional[list[dict]] = None,
+    protect_content: bool = False,
+    has_spoiler: bool = False,
+    buttons: Optional[list[dict]] = None,
+    extra_buttons: Optional[list[list[InlineKeyboardButton]]] = None,
+    destruct_seconds: int = 0,
+) -> list[int]:
+    """
+    Send a message and optionally schedule self-destruct.
+    Returns list of ALL Telegram message_ids sent, or empty list on failure.
+    
+    Priority: media_list (multi) > media_type+media_file_id (single) > text only
+    """
+    kb       = _build_keyboard(buttons or [], extra_buttons)
+    sent_ids = []
+
+    try:
+        # ── Multi-media (media group) ─────────────────────────────────────
+        if media_list and len(media_list) > 1:
+            group = []
+            for i, item in enumerate(media_list):
+                cap = text if i == 0 else None  # caption on first item only
+                group.append(_make_input_media(item, caption=cap, spoiler=has_spoiler))
+
+            results = await bot.send_media_group(
+                chat_id=chat_id,
+                media=group,
+                protect_content=protect_content,
+            )
+            sent_ids = [m.message_id for m in results]
+
+            # send_media_group can't attach buttons, so send buttons separately
+            if kb:
+                btn_msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text="👇👇👇👇👇👇👇👇👇👇👇👇👇👇",
+                    protect_content=protect_content,
+                    reply_markup=kb,
+                )
+                sent_ids.append(btn_msg.message_id)
+
+        # ── Single media (from media_list[0] or legacy fields) ────────────
+        elif media_list and len(media_list) == 1:
+            item = media_list[0]
+            sent = await _send_single_media(
+                bot, chat_id, item["type"], item["file_id"],
+                text, protect_content, has_spoiler, kb,
+            )
+            if sent:
+                sent_ids.append(sent.message_id)
+
+        elif media_type != "none" and media_file_id:
+            sent = await _send_single_media(
+                bot, chat_id, media_type, media_file_id,
+                text, protect_content, has_spoiler, kb,
+            )
+            if sent:
+                sent_ids.append(sent.message_id)
+
+        # ── Text only ─────────────────────────────────────────────────────
+        else:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=text or "—",
+                parse_mode="HTML",
+                protect_content=protect_content,
+                reply_markup=kb,
+            )
+            sent_ids.append(sent.message_id)
+
+    except TelegramError as e:
+        logger.warning(f"send_configured_message to {chat_id} failed: {e}")
+        return []
+
+    if not sent_ids:
+        return []
+
+    # Schedule self-destruct for ALL sent messages
+    if destruct_seconds > 0:
+        with get_session() as session:
+            for mid in sent_ids:
+                db.schedule_destruct(session, chat_id, mid, destruct_seconds)
+
+    return sent_ids
+
+
+async def _send_single_media(bot, chat_id, media_type, file_id, text, protect, spoiler, kb):
+    """Send a single media item. Returns the sent Message or None."""
+    if media_type == "photo":
+        return await bot.send_photo(
+            chat_id=chat_id, photo=file_id, caption=text,
+            parse_mode="HTML", has_spoiler=spoiler,
+            protect_content=protect, reply_markup=kb,
+        )
+    if media_type == "video":
+        return await bot.send_video(
+            chat_id=chat_id, video=file_id, caption=text,
+            parse_mode="HTML", has_spoiler=spoiler,
+            protect_content=protect, reply_markup=kb,
+        )
+    if media_type == "audio":
+        return await bot.send_audio(
+            chat_id=chat_id, audio=file_id, caption=text,
+            parse_mode="HTML", protect_content=protect, reply_markup=kb,
+        )
+    if media_type == "document":
+        return await bot.send_document(
+            chat_id=chat_id, document=file_id, caption=text,
+            parse_mode="HTML", protect_content=protect, reply_markup=kb,
+        )
+    return None
+
+
+
+==================================================
+مسار الملف: bot/services/referral.py
+==================================================
+
+"""
+Referral / invite-link service.
+Invite links are generated by admins only — not exposed to regular users.
+"""
+import config
+from database.models import get_session
+from database import db
+
+
+def build_invite_url(token: str) -> str:
+    """Build a t.me deep-link from an invite token."""
+    return f"https://t.me/{config.BOT_USERNAME}?start=ref_{token}"
+
+
+def get_or_create_user_invite(owner_telegram_id: int) -> str:
+    """Return the first invite token for this owner (admin), creating one if needed."""
+    with get_session() as session:
+        links = db.get_user_invite_links(session, owner_telegram_id)
+        if links:
+            return links[0].token
+        link = db.create_invite_link(session, owner_telegram_id)
+        return link.token
+
+
+def parse_referral_token(start_param: str) -> str | None:
+    """Extract token from 'ref_<token>' start param. Returns None if not a referral."""
+    if start_param and start_param.startswith("ref_"):
+        return start_param[4:]
+    return None
+
+
+def resolve_referrer(token: str) -> int | None:
+    """
+    Return the telegram_id of the invite link owner, or None.
+    Increments use count on the link.
+    """
+    with get_session() as session:
+        link = db.get_invite_link_by_token(session, token)
+        if link:
+            db.increment_link_uses(session, token)
+            return link.owner_id
+    return None
+
+
+
+==================================================
+مسار الملف: bot/services/scheduler.py
+==================================================
+
+"""
+APScheduler wrapper for scheduled broadcasts and cleanup jobs.
+"""
+import logging
+import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from database.models import get_session, MessageStatus
+from database import db
+
+logger = logging.getLogger(__name__)
+
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+def start_scheduler():
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("Scheduler started.")
+
+
+def stop_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
+# ─── Broadcast job ────────────────────────────────────────────────────────────
+
+async def _run_broadcast(bot, message_id: int, target: str = "users"):
+    from bot.services.broadcast import broadcast
+    logger.info(f"Running scheduled broadcast msg={message_id} target={target}")
+    stats = await broadcast(bot, message_id, target=target)
+    logger.info(f"Broadcast done: {stats}")
+
+
+def schedule_broadcast(
+    bot,
+    message_id: int,
+    run_at: datetime.datetime | None = None,
+    interval_hours: float | None = None,
+    target: str = "users",
+):
+    """Schedule a broadcast. Supports one-shot and repeating."""
+    job_id = f"broadcast_{message_id}"
+
+    if interval_hours and interval_hours > 0:
+        scheduler.add_job(
+            _run_broadcast,
+            trigger=IntervalTrigger(hours=interval_hours),
+            id=job_id,
+            args=[bot, message_id, target],
+            next_run_time=run_at or datetime.datetime.utcnow(),
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+    else:
+        run_time = run_at or datetime.datetime.utcnow()
+        scheduler.add_job(
+            _run_broadcast,
+            trigger=DateTrigger(run_date=run_time),
+            id=job_id,
+            args=[bot, message_id, target],
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+    logger.info(f"Scheduled job {job_id} at {run_at} interval={interval_hours}h target={target}")
+
+
+def cancel_broadcast(message_id: int):
+    job_id = f"broadcast_{message_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        logger.info(f"Cancelled job {job_id}")
+
+
+# ─── Cleanup job ─────────────────────────────────────────────────────────────
+
+async def _cleanup_job(bot):
+    from bot.services.broadcast import delete_expired_messages
+    await delete_expired_messages(bot)
+
+
+def schedule_cleanup(bot):
+    scheduler.add_job(
+        _cleanup_job,
+        trigger=IntervalTrigger(seconds=30),
+        id="cleanup_expired",
+        args=[bot],
+        replace_existing=True,
+    )
+    logger.info("Cleanup job scheduled every 30s.")
+
+
+# ─── Restore on startup ───────────────────────────────────────────────────────
+
+def restore_scheduled_jobs(bot):
+    with get_session() as session:
+        pending = db.get_all_messages(session, status=MessageStatus.SCHEDULED)
+        # Serialize inside session
+        jobs = [
+            {"id": m.id, "scheduled_at": m.scheduled_at, "interval_hours": m.interval_hours}
+            for m in pending
+        ]
+    for j in jobs:
+        schedule_broadcast(bot, j["id"], run_at=j["scheduled_at"], interval_hours=j["interval_hours"])
+    logger.info(f"Restored {len(jobs)} scheduled broadcast jobs.")
+
+
+
+==================================================
+مسار الملف: logs/.gitkeep
+==================================================
+
+# This directory stores PM2 and application log files.
+# The directory is tracked by Git but log files are ignored via .gitignore.
+
+
+

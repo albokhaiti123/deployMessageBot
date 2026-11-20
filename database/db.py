@@ -1,5 +1,10 @@
 """
 Database helper functions (CRUD operations).
+Phase-1 fixes:
+  - record_purchase / user_has_purchased: use purchase_type instead of message_id=-1
+  - delete_message_record: safe delete (detach purchases, remove views)
+  - mark_broadcast_executed: keeps repeating jobs SCHEDULED
+  - get_or_create_user: prevent self-referral
 """
 import json
 import datetime
@@ -40,7 +45,8 @@ def get_or_create_user(
         user.username = username
         user.full_name = full_name
         user.last_seen = datetime.datetime.utcnow()
-        if not user.referred_by and referred_by:
+        # FIX: prevent self-referral when updating existing user
+        if not user.referred_by and referred_by and referred_by != telegram_id:
             user.referred_by = referred_by
         session.commit()
     return user, created
@@ -96,12 +102,11 @@ def save_last_start_msg_ids(session: Session, telegram_id: int, msg_ids: list[in
 
 
 def get_last_start_msg_ids(session: Session, telegram_id: int) -> list[int]:
-    """Get stored last /start message_ids as a list."""
+    """Get stored last /start message_ids as a list (handles both old int and new JSON)."""
     user = get_user_by_telegram_id(session, telegram_id)
     if not user or not user.last_start_msg_id:
         return []
     raw = user.last_start_msg_id
-    # Handle both old single-int and new JSON list formats
     if isinstance(raw, int):
         return [raw]
     try:
@@ -116,7 +121,6 @@ def get_last_start_msg_ids(session: Session, telegram_id: int) -> list[int]:
 
 def cancel_destruct_for_msg(session: Session, chat_id: int, message_id: int):
     """Mark any pending SelfDestructJob for this specific message as done."""
-    from database.models import SelfDestructJob
     rows = (
         session.query(SelfDestructJob)
         .filter_by(chat_id=chat_id, message_id=message_id, deleted=False)
@@ -184,13 +188,35 @@ def update_message_status(session: Session, msg_id: int, status: MessageStatus):
         session.commit()
 
 
-def delete_message_record(session: Session, msg_id: int) -> bool:
+def mark_broadcast_executed(session: Session, msg_id: int, is_repeating: bool = False):
+    """
+    Record execution timestamp.
+    FIX: repeating broadcasts stay SCHEDULED (not SENT) so they survive restart.
+    """
     msg = get_message_by_id(session, msg_id)
     if msg:
-        session.delete(msg)
+        msg.sent_at = datetime.datetime.utcnow()
+        msg.status = MessageStatus.SCHEDULED if is_repeating else MessageStatus.SENT
         session.commit()
-        return True
-    return False
+
+
+def delete_message_record(session: Session, msg_id: int) -> bool:
+    """
+    Safely delete a BroadcastMessage.
+    FIX: detach purchases (preserve revenue history), remove orphan views, then delete.
+    """
+    msg = get_message_by_id(session, msg_id)
+    if not msg:
+        return False
+    # Detach purchases → preserve revenue record, avoid FK IntegrityError
+    session.query(Purchase).filter_by(message_id=msg_id).update(
+        {Purchase.message_id: None}, synchronize_session=False
+    )
+    # Cascade-delete views (or explicit delete for safety)
+    session.query(MessageView).filter_by(message_id=msg_id).delete(synchronize_session=False)
+    session.delete(msg)
+    session.commit()
+    return True
 
 
 # ─── Purchase CRUD ───────────────────────────────────────────────────────────
@@ -198,13 +224,22 @@ def delete_message_record(session: Session, msg_id: int) -> bool:
 def record_purchase(
     session: Session,
     user_db_id: int,
-    message_id: int,
+    message_id: Optional[int],
     stars_paid: int,
     charge_id: Optional[str] = None,
+    purchase_type: str = "broadcast",
 ) -> Purchase:
+    """
+    FIX: use purchase_type="start_msg" with message_id=None instead of -1.
+    """
+    if purchase_type == "start_msg" or message_id == -1:
+        purchase_type = "start_msg"
+        message_id = None
+
     purchase = Purchase(
         user_id=user_db_id,
         message_id=message_id,
+        purchase_type=purchase_type,
         stars_paid=stars_paid,
         telegram_payment_charge_id=charge_id,
     )
@@ -214,12 +249,29 @@ def record_purchase(
     return purchase
 
 
-def user_has_purchased(session: Session, user_db_id: int, message_id: int) -> bool:
+def user_has_purchased(
+    session: Session,
+    user_db_id: int,
+    message_id: Optional[int] = None,
+    purchase_type: str = "broadcast",
+) -> bool:
+    """
+    FIX: check by purchase_type for start_msg, by message_id for broadcast.
+    """
+    if purchase_type == "start_msg" or message_id == -1:
+        return (
+            session.query(Purchase)
+            .filter_by(user_id=user_db_id, purchase_type="start_msg")
+            .first() is not None
+        )
     return (
         session.query(Purchase)
-        .filter_by(user_id=user_db_id, message_id=message_id)
-        .first()
-        is not None
+        .filter_by(
+            user_id=user_db_id,
+            message_id=message_id,
+            purchase_type="broadcast",
+        )
+        .first() is not None
     )
 
 
@@ -248,7 +300,6 @@ def record_view(
 
 
 def get_pending_deletions(session: Session, now: datetime.datetime) -> list[MessageView]:
-    from database.models import BroadcastMessage, DestructMode
     return (
         session.query(MessageView)
         .join(BroadcastMessage)
@@ -372,7 +423,6 @@ def get_welcome_config(session: Session) -> dict:
             "buttons": [],
         }
     media_list = json.loads(row.media_json or "[]")
-    # Backward compat
     if not media_list and row.media_file_id and row.media_type and row.media_type != "none":
         media_list = [{"type": row.media_type, "file_id": row.media_file_id}]
     return {
@@ -429,7 +479,6 @@ def get_start_msg_config(session: Session) -> dict:
             "show_mode": "always",
         }
     media_list = json.loads(row.media_json or "[]")
-    # Backward compat: if media_list is empty but legacy single exists
     if not media_list and row.media_file_id and row.media_type and row.media_type != "none":
         media_list = [{"type": row.media_type, "file_id": row.media_file_id}]
     return {
@@ -458,7 +507,6 @@ def save_start_msg_config(session: Session, **kwargs):
             row.buttons_json = json.dumps(val, ensure_ascii=False)
         elif key == "media_list":
             row.media_json = json.dumps(val, ensure_ascii=False)
-            # Also set legacy fields from first item
             if val:
                 row.media_type = val[0].get("type", "none")
                 row.media_file_id = val[0].get("file_id")
@@ -492,8 +540,7 @@ def get_due_destruct_jobs(session: Session, now: datetime.datetime) -> list[dict
         )
         .all()
     )
-    result = [{"id": r.id, "chat_id": r.chat_id, "message_id": r.message_id} for r in rows]
-    return result
+    return [{"id": r.id, "chat_id": r.chat_id, "message_id": r.message_id} for r in rows]
 
 
 def mark_destruct_done(session: Session, job_id: int):

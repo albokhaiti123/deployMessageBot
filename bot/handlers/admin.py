@@ -1,6 +1,7 @@
 """
 Admin control panel — fully integrated with all features.
 """
+import asyncio
 import json
 import logging
 import datetime
@@ -20,6 +21,8 @@ from bot.services.broadcast import broadcast
 from bot.services.message_sender import send_configured_message
 
 logger = logging.getLogger(__name__)
+
+MAX_MEDIA_ITEMS = 10
 
 # ─── States ──────────────────────────────────────────────────────────────────
 (
@@ -43,6 +46,32 @@ logger = logging.getLogger(__name__)
 
 
 # ─── Admin guard ──────────────────────────────────────────────────────────────
+
+async def _run_broadcast_task(bot, admin_chat_id: int, msg_id: int, target: str, reply_markup):
+    """Run broadcast in background so bot never blocks updates or payments."""
+    try:
+        stats = await broadcast(bot, msg_id, target=target)
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                f"✅ <b>اكتمل البث للرسالة #{msg_id}!</b>\n"
+                f"👥 {stats.get('users_total', 0)} مستخدم | 💬 {stats.get('groups_total', 0)} مجموعة\n"
+                f"✅ {stats.get('success', 0)} | ❌ {stats.get('failed', 0)}"
+            ),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        logger.exception(f"Background broadcast #{msg_id} failed: {e}")
+        try:
+            await bot.send_message(
+                chat_id=admin_chat_id,
+                text=f"❌ فشل البث للرسالة #{msg_id}.",
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            pass
+
 
 def admin_only(func):
     @wraps(func)
@@ -220,12 +249,23 @@ async def bc_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"type": "photo", "file_id": m.photo[-1].file_id}
     elif m.video:
         item = {"type": "video", "file_id": m.video.file_id}
-    elif m.audio or m.voice:
-        item = {"type": "audio", "file_id": (m.audio or m.voice).file_id}
+    elif m.voice:
+        item = {"type": "voice", "file_id": m.voice.file_id}
+    elif m.audio:
+        item = {"type": "audio", "file_id": m.audio.file_id}
     elif m.document:
         item = {"type": "document", "file_id": m.document.file_id}
 
     if item:
+        ml = context.user_data["bc"]["media_list"]
+        if len(ml) >= MAX_MEDIA_ITEMS:
+            await m.reply_text(
+                f"⚠️ الحد الأقصى {MAX_MEDIA_ITEMS} وسائط. اضغط ✅ انتهيت.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ انتهيت", callback_data="bc_media_done")],
+                ]),
+            )
+            return BC_MEDIA
         context.user_data["bc"]["media_list"].append(item)
         # If message has caption and no text yet, use it
         if m.caption and not context.user_data["bc"].get("text"):
@@ -360,12 +400,23 @@ async def bc_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def bc_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        dt = datetime.datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M")
-    except:
-        await update.message.reply_text("❌ صيغة خاطئة", reply_markup=CXL)
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(config.SCHEDULER_TIMEZONE)
+        dt_naive = datetime.datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M")
+        dt_local = dt_naive.replace(tzinfo=tz)
+        now_local = datetime.datetime.now(tz)
+        if dt_local <= now_local:
+            await update.message.reply_text(
+                f"❌ الوقت في الماضي! الوقت الحالي: {now_local.strftime('%Y-%m-%d %H:%M')} ({config.SCHEDULER_TIMEZONE})",
+                reply_markup=CXL,
+            )
+            return BC_SCHEDULE_TIME
+        dt_utc_naive = dt_local.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        context.user_data["bc"]["sched_at"] = dt_utc_naive
+        context.user_data["bc"]["interval"] = None
+    except (ValueError, KeyError):
+        await update.message.reply_text("❌ صيغة خاطئة. مثال: 2025-12-31 18:00", reply_markup=CXL)
         return BC_SCHEDULE_TIME
-    context.user_data["bc"]["sched_at"] = dt
-    context.user_data["bc"]["interval"] = None
     return await _bc_ask_buttons(update.message)
 
 
@@ -458,6 +509,8 @@ async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "audio": MediaType.AUDIO, "document": MediaType.DOCUMENT}
     dest_mode = DestructMode.AFTER_TIME if bc.get("destruct", 0) > 0 else DestructMode.NEVER
 
+    target = bc.get("target", "users")
+
     with get_session() as session:
         msg_obj = db.create_broadcast_message(
             session,
@@ -471,19 +524,15 @@ async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status=MessageStatus.DRAFT, created_by=update.effective_user.id,
             buttons_json=json.dumps(bc.get("buttons", []), ensure_ascii=False),
             media_json=json.dumps(bc.get("media_list", []), ensure_ascii=False),
+            target=target,
         )
         msg_id = msg_obj.id
-
-    target = bc.get("target", "users")
     is_now = not bc.get("interval") and not bc.get("sched_at")
 
     if is_now:
-        await q.message.edit_text("⏳ <b>جارٍ البث...</b>", parse_mode="HTML")
-        stats = await broadcast(context.bot, msg_id, target=target)
-        await q.message.reply_text(
-            f"✅ <b>اكتمل!</b>\n👥 {stats.get('users_total',0)} | 💬 {stats.get('groups_total',0)}\n"
-            f"✅ {stats.get('success',0)} | ❌ {stats.get('failed',0)}",
-            parse_mode="HTML", reply_markup=_menu_kb(),
+        await q.message.edit_text("⏳ <b>بدأ البث في الخلفية...</b>", parse_mode="HTML")
+        asyncio.create_task(
+            _run_broadcast_task(context.bot, update.effective_chat.id, msg_id, target, _menu_kb())
         )
     else:
         with get_session() as session:
@@ -551,9 +600,13 @@ async def manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "go_menu": return await cmd_admin(update, context)
     action, mid = q.data.split("_")[0], int(q.data.split("_")[1])
     if action == "send":
-        await q.message.edit_text("⏳ جارٍ البث...")
-        stats = await broadcast(context.bot, mid, target="users")
-        await q.message.reply_text(f"✅ نجح: {stats.get('success',0)} | فشل: {stats.get('failed',0)}", reply_markup=_back("go_manage"))
+        with get_session() as session:
+            m_obj = db.get_message_by_id(session, mid)
+            target = (getattr(m_obj, "target", "users") or "users") if m_obj else "users"
+        await q.message.edit_text("⏳ <b>بدأ البث في الخلفية...</b>", parse_mode="HTML")
+        asyncio.create_task(
+            _run_broadcast_task(context.bot, update.effective_chat.id, mid, target, _back("go_manage"))
+        )
     elif action == "del":
         sched.cancel_broadcast(mid)
         with get_session() as session:
@@ -763,6 +816,8 @@ async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"type": "photo", "file_id": m.photo[-1].file_id}
     elif m.video:
         item = {"type": "video", "file_id": m.video.file_id}
+    elif m.voice:
+        item = {"type": "voice", "file_id": m.voice.file_id}
     elif m.audio:
         item = {"type": "audio", "file_id": m.audio.file_id}
     elif m.document:
@@ -771,6 +826,14 @@ async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if item:
         if "_wel_media" not in context.user_data:
             context.user_data["_wel_media"] = []
+        if len(context.user_data["_wel_media"]) >= MAX_MEDIA_ITEMS:
+            await m.reply_text(
+                f"⚠️ الحد الأقصى {MAX_MEDIA_ITEMS} وسائط. اضغط ✅ انتهيت.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ انتهيت", callback_data="wel_media_done")],
+                ]),
+            )
+            return WEL_MEDIA
         context.user_data["_wel_media"].append(item)
         if m.caption:
             with get_session() as session:
@@ -990,6 +1053,8 @@ async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"type": "photo", "file_id": m.photo[-1].file_id}
     elif m.video:
         item = {"type": "video", "file_id": m.video.file_id}
+    elif m.voice:
+        item = {"type": "voice", "file_id": m.voice.file_id}
     elif m.audio:
         item = {"type": "audio", "file_id": m.audio.file_id}
     elif m.document:
@@ -998,6 +1063,14 @@ async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if item:
         if "_sm_media" not in context.user_data:
             context.user_data["_sm_media"] = []
+        if len(context.user_data["_sm_media"]) >= MAX_MEDIA_ITEMS:
+            await m.reply_text(
+                f"⚠️ الحد الأقصى {MAX_MEDIA_ITEMS} وسائط. اضغط ✅ انتهيت.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ انتهيت", callback_data="sm_media_done")],
+                ]),
+            )
+            return SM_MEDIA
         context.user_data["_sm_media"].append(item)
         if m.caption:
             with get_session() as session:
