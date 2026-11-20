@@ -5,17 +5,24 @@ Phase-1 fixes:
   - delete_message_record: safe delete (detach purchases, remove views)
   - mark_broadcast_executed: keeps repeating jobs SCHEDULED
   - get_or_create_user: prevent self-referral
+Phase-2 fixes:
+  - get_total_stars_earned: SQL aggregation instead of loading all rows
+  - deactivate_users_batch / deactivate_groups_batch: bulk UPDATE
+  - get_messages_paginated, get_message_stats: SQL-level pagination/aggregation
+  - get_purchased_user_ids: set of user DB IDs
+  - schedule_destruct_batch, mark_destruct_done_batch, purge_old_destruct_jobs
 """
 import json
 import datetime
 import secrets
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from database.models import (
     User, BroadcastMessage, Purchase, MessageView, InviteLink,
-    WelcomeConfig, StartMessageConfig, SelfDestructJob,
-    MediaType, DestructMode, MessageStatus, get_session
+    WelcomeConfig, StartMessageConfig, SelfDestructJob, BotGroup,
+    MediaType, DestructMode, MessageStatus, get_session, utcnow_naive
 )
 
 
@@ -44,7 +51,7 @@ def get_or_create_user(
     else:
         user.username = username
         user.full_name = full_name
-        user.last_seen = datetime.datetime.utcnow()
+        user.last_seen = utcnow_naive()
         # FIX: prevent self-referral when updating existing user
         if not user.referred_by and referred_by and referred_by != telegram_id:
             user.referred_by = referred_by
@@ -184,7 +191,7 @@ def update_message_status(session: Session, msg_id: int, status: MessageStatus):
     if msg:
         msg.status = status
         if status == MessageStatus.SENT:
-            msg.sent_at = datetime.datetime.utcnow()
+            msg.sent_at = utcnow_naive()
         session.commit()
 
 
@@ -195,7 +202,7 @@ def mark_broadcast_executed(session: Session, msg_id: int, is_repeating: bool = 
     """
     msg = get_message_by_id(session, msg_id)
     if msg:
-        msg.sent_at = datetime.datetime.utcnow()
+        msg.sent_at = utcnow_naive()
         msg.status = MessageStatus.SCHEDULED if is_repeating else MessageStatus.SENT
         session.commit()
 
@@ -276,8 +283,9 @@ def user_has_purchased(
 
 
 def get_total_stars_earned(session: Session) -> int:
-    result = session.query(Purchase).all()
-    return sum(p.stars_paid for p in result)
+    """Compute total Stars revenue directly in SQL."""
+    total = session.query(func.coalesce(func.sum(Purchase.stars_paid), 0)).scalar()
+    return int(total or 0)
 
 
 # ─── MessageView CRUD ─────────────────────────────────────────────────────────
@@ -316,7 +324,7 @@ def get_pending_deletions(session: Session, now: datetime.datetime) -> list[Mess
 def mark_view_deleted(session: Session, view_id: int):
     view = session.query(MessageView).filter_by(id=view_id).first()
     if view:
-        view.deleted_at = datetime.datetime.utcnow()
+        view.deleted_at = utcnow_naive()
         session.commit()
 
 
@@ -380,7 +388,7 @@ def upsert_group(session: Session, chat_id: int, title: str, username: Optional[
         row.title     = title
         row.username  = username
         row.is_active = True
-        row.last_seen = datetime.datetime.utcnow()
+        row.last_seen = utcnow_naive()
     else:
         row = BotGroup(chat_id=chat_id, title=title, username=username)
         session.add(row)
@@ -524,7 +532,7 @@ def schedule_destruct(session: Session, chat_id: int, message_id: int, seconds: 
     """Register a message for auto-deletion after `seconds`."""
     if seconds <= 0:
         return
-    delete_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)
+    delete_at = utcnow_naive() + datetime.timedelta(seconds=seconds)
     job = SelfDestructJob(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
     session.add(job)
     session.commit()
@@ -548,3 +556,109 @@ def mark_destruct_done(session: Session, job_id: int):
     if row:
         row.deleted = True
         session.commit()
+
+
+# ─── Phase-2 Batch / Aggregation Functions ───────────────────────────────────
+
+def deactivate_users_batch(session: Session, telegram_ids: list[int]) -> int:
+    """Mark users who blocked the bot as inactive in a single query."""
+    if not telegram_ids:
+        return 0
+    count = (
+        session.query(User)
+        .filter(User.telegram_id.in_(telegram_ids))
+        .update({User.is_active: False}, synchronize_session=False)
+    )
+    session.commit()
+    return count
+
+
+def deactivate_groups_batch(session: Session, chat_ids: list[int]) -> int:
+    """Mark unreachable/kicked groups as inactive in a single query."""
+    if not chat_ids:
+        return 0
+    count = (
+        session.query(BotGroup)
+        .filter(BotGroup.chat_id.in_(chat_ids))
+        .update({BotGroup.is_active: False}, synchronize_session=False)
+    )
+    session.commit()
+    return count
+
+
+def get_messages_paginated(
+    session: Session, page: int = 0, per_page: int = 8
+) -> tuple[list[BroadcastMessage], int]:
+    """Return (page_items, total_count) ordered newest-first."""
+    total = session.query(func.count(BroadcastMessage.id)).scalar() or 0
+    items = (
+        session.query(BroadcastMessage)
+        .order_by(BroadcastMessage.created_at.desc())
+        .offset(page * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return items, total
+
+
+def get_message_stats(session: Session) -> dict[str, int]:
+    """Count messages by status in SQL without loading rows into memory."""
+    rows = (
+        session.query(BroadcastMessage.status, func.count(BroadcastMessage.id))
+        .group_by(BroadcastMessage.status)
+        .all()
+    )
+    counts = {status.value: cnt for status, cnt in rows}
+    return {
+        "sent":      counts.get("sent", 0),
+        "scheduled": counts.get("scheduled", 0),
+        "draft":     counts.get("draft", 0),
+        "cancelled": counts.get("cancelled", 0),
+    }
+
+
+def get_purchased_user_ids(session: Session, message_id: int) -> set[int]:
+    """Return set of user DB IDs that already purchased a broadcast message."""
+    rows = (
+        session.query(Purchase.user_id)
+        .filter_by(message_id=message_id, purchase_type="broadcast")
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+def schedule_destruct_batch(
+    session: Session, chat_id: int, message_ids: list[int], seconds: int
+):
+    """Register multiple messages for auto-deletion in a single commit."""
+    if seconds <= 0 or not message_ids:
+        return
+    delete_at = utcnow_naive() + datetime.timedelta(seconds=seconds)
+    jobs = [
+        SelfDestructJob(chat_id=chat_id, message_id=mid, delete_at=delete_at)
+        for mid in message_ids
+    ]
+    session.add_all(jobs)
+    session.commit()
+
+
+def mark_destruct_done_batch(session: Session, job_ids: list[int]):
+    """Mark multiple completed SelfDestructJob rows as deleted in one query."""
+    if not job_ids:
+        return
+    session.query(SelfDestructJob).filter(SelfDestructJob.id.in_(job_ids)).update(
+        {SelfDestructJob.deleted: True}, synchronize_session=False
+    )
+    session.commit()
+
+
+def purge_old_destruct_jobs(session: Session, older_than_days: int = 7) -> int:
+    """Delete completed SelfDestructJob rows older than `older_than_days`."""
+    cutoff = utcnow_naive() - datetime.timedelta(days=older_than_days)
+    deleted = (
+        session.query(SelfDestructJob)
+        .filter(SelfDestructJob.deleted == True, SelfDestructJob.delete_at < cutoff)
+        .delete(synchronize_session=False)
+    )
+    session.commit()
+    return deleted

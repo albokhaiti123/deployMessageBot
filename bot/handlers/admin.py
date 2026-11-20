@@ -6,6 +6,7 @@ import json
 import logging
 import datetime
 from functools import wraps
+from urllib.parse import urlparse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,6 +24,7 @@ from bot.services.message_sender import send_configured_message
 logger = logging.getLogger(__name__)
 
 MAX_MEDIA_ITEMS = 10
+MANAGE_PER_PAGE = 8
 
 # ─── States ──────────────────────────────────────────────────────────────────
 (
@@ -73,6 +75,30 @@ async def _run_broadcast_task(bot, admin_chat_id: int, msg_id: int, target: str,
             pass
 
 
+def _is_valid_url(url: str) -> bool:
+    """Strict HTTP/HTTPS URL validation for Telegram inline URL buttons."""
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc) and "." in parsed.netloc
+    except ValueError:
+        return False
+
+
+def super_admin_only(func):
+    """Restrict sensitive operations (admin management) to static .env admins."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
+        uid = update.effective_user.id
+        if not config.is_static_admin(uid):
+            if update.callback_query:
+                await update.callback_query.answer("🚫 للمشرف الرئيسي فقط.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("🚫 هذه الصلاحية للمشرف الرئيسي فقط.")
+            return MENU
+        return await func(update, context, *a, **kw)
+    return wrapper
+
+
 def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
@@ -89,23 +115,26 @@ def admin_only(func):
 
 # ─── Shared keyboards ────────────────────────────────────────────────────────
 
-def _menu_kb():
-    # Check notification setting
+def _menu_kb(uid: int = 0):
     with get_session() as session:
         notif = db.get_setting(session, "notify_new_user", "true")
     notif_icon = "🔔" if notif == "true" else "🔕"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📨 إنشاء رسالة بث",    callback_data="m_new")],
         [InlineKeyboardButton("📋 إدارة الرسائل",      callback_data="m_manage")],
         [InlineKeyboardButton("📊 الإحصائيات",         callback_data="m_stats")],
         [InlineKeyboardButton("🔗 رابط دعوة",          callback_data="m_invite")],
         [InlineKeyboardButton("📩 رسالة الترحيب",      callback_data="m_welcome")],
         [InlineKeyboardButton("🚀 رسالة /Start",       callback_data="m_startmsg")],
-        [InlineKeyboardButton("👑 إدارة المشرفين",     callback_data="m_admins")],
+    ]
+    if not uid or config.is_static_admin(uid):
+        rows.append([InlineKeyboardButton("👑 إدارة المشرفين", callback_data="m_admins")])
+    rows.extend([
         [InlineKeyboardButton(f"{notif_icon} إشعارات الانضمام", callback_data="m_notif")],
         [InlineKeyboardButton("🚫 حظر", callback_data="m_ban"),
          InlineKeyboardButton("✅ رفع حظر", callback_data="m_unban")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 CXL = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cxl")]])
 
@@ -119,15 +148,16 @@ def _back(cb="go_menu"):
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    uid = update.effective_user.id
     txt = "🛠️ <b>لوحة التحكم</b>\n\nاختر الإجراء:"
     if update.message:
-        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb())
+        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb(uid))
     else:
         await update.callback_query.answer()
         try:
-            await update.callback_query.edit_message_text(txt, parse_mode="HTML", reply_markup=_menu_kb())
+            await update.callback_query.edit_message_text(txt, parse_mode="HTML", reply_markup=_menu_kb(uid))
         except Exception:
-            await update.callback_query.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb())
+            await update.callback_query.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb(uid))
     return MENU
 
 
@@ -135,23 +165,20 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cxl_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("تم الإلغاء")
     context.user_data.clear()
-    await update.callback_query.edit_message_text("❌ تم الإلغاء.", reply_markup=_menu_kb())
+    uid = update.effective_user.id
+    try:
+        await update.callback_query.edit_message_text("❌ تم الإلغاء.", reply_markup=_menu_kb(uid))
+    except Exception:
+        await update.callback_query.message.reply_text("❌ تم الإلغاء.", reply_markup=_menu_kb(uid))
     return MENU
 
 
 @admin_only
 async def menu_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     d = q.data
+    uid = update.effective_user.id
 
-    if d == "m_new":     return await _bc_start(q, context)
-    if d == "m_manage":  return await _manage_list(q)
-    if d == "m_stats":   return await _stats(q)
-    if d == "m_invite":  return await _invite_menu(q)
-    if d == "m_welcome": return await _wel_panel(q)
-    if d == "m_startmsg":return await _sm_panel(q)
-    if d == "m_admins":  return await _admins_menu(q, context)
     if d == "m_notif":
         with get_session() as session:
             current = db.get_setting(session, "notify_new_user", "true")
@@ -160,10 +187,19 @@ async def menu_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "🔔 مفعّلة" if new_val == "true" else "🔕 معطّلة"
         await q.answer(f"إشعارات الانضمام: {status}", show_alert=True)
         try:
-            await q.edit_message_reply_markup(reply_markup=_menu_kb())
+            await q.edit_message_reply_markup(reply_markup=_menu_kb(uid))
         except Exception:
             pass
         return MENU
+
+    await q.answer()
+    if d == "m_new":      return await _bc_start(q, context)
+    if d == "m_manage":   return await _manage_list(q, page=0)
+    if d == "m_stats":    return await _stats(q)
+    if d == "m_invite":   return await _invite_menu(q)
+    if d == "m_welcome":  return await _wel_panel(q)
+    if d == "m_startmsg": return await _sm_panel(q)
+    if d == "m_admins":   return await _admins_menu(update, context)
     if d == "m_ban":
         await q.message.reply_text("🚫 أدخل معرف المستخدم لحظره:", reply_markup=CXL)
         context.user_data["ban_action"] = "ban"
@@ -232,8 +268,15 @@ async def bc_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if d in ("bc_media_done", "bc_media_skip"):
             if d == "bc_media_skip":
                 context.user_data["bc"]["media_list"] = []
-            # Set legacy fields from first item
             ml = context.user_data["bc"]["media_list"]
+            txt_val = (context.user_data["bc"].get("text") or "").strip()
+            if not ml and not txt_val:
+                await update.callback_query.message.reply_text(
+                    "⚠️ لا يمكن إنشاء رسالة فارغة تماماً (بلا نص وبلا وسائط).\n"
+                    "أرسل وسائط الآن أو اضغط إلغاء للبدء بنص.",
+                    reply_markup=CXL,
+                )
+                return BC_MEDIA
             if ml:
                 context.user_data["bc"]["media_type"] = ml[0]["type"]
                 context.user_data["bc"]["file_id"] = ml[0]["file_id"]
@@ -313,7 +356,7 @@ async def bc_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bc_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         s = int(update.message.text.strip()); assert s >= 1
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ أدخل رقماً > 0", reply_markup=CXL)
         return BC_STARS
     context.user_data["bc"]["stars"] = s
@@ -344,7 +387,7 @@ async def bc_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bc_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         s = int(update.message.text.strip()); assert s >= 0
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ أدخل رقماً ≥ 0", reply_markup=CXL)
         return BC_DESTRUCT
     context.user_data["bc"]["destruct"] = s
@@ -424,7 +467,7 @@ async def bc_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bc_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         h = float(update.message.text.strip()); assert h > 0
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ أدخل رقماً > 0", reply_markup=CXL)
         return BC_INTERVAL
     context.user_data["bc"]["interval"] = h
@@ -460,8 +503,8 @@ async def bc_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def bc_btn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ يجب أن يبدأ بـ http", reply_markup=CXL)
+    if not _is_valid_url(url):
+        await update.message.reply_text("❌ رابط غير صالح. مثال: https://example.com", reply_markup=CXL)
         return BC_BTN_URL
     bc = context.user_data["bc"]
     name = bc.pop("_btn_name", "زر")
@@ -486,12 +529,15 @@ async def _bc_confirm(msg, context):
         f"🔁 كل {bc['interval']}h" if bc.get("interval") else str(bc.get("sched_at")))
     btns = len(bc.get("buttons", []))
     media_n = len(bc.get("media_list", []))
+    group_warn = ""
+    if bc.get("is_paid") and bc.get("target") in ("groups", "all"):
+        group_warn = "\n⚠️ <i>ملاحظة: المجموعات ستستلم المحتوى مفتوحاً (الدفع بالنجوم للمحادثات الخاصة فقط).</i>"
 
     await msg.reply_text(
         f"📋 <b>مراجعة الرسالة</b>\n\n"
         f"📷 وسائط: {media_n}\n"
         f"💵 {paid}\n🔒 حماية: {'✅' if bc.get('protect') else '❌'}\n"
-        f"💣 تدمير: {dest}\n📡 {tgt}\n⏰ {sch}\n🔘 أزرار: {btns}",
+        f"💣 تدمير: {dest}\n📡 {tgt}\n⏰ {sch}\n🔘 أزرار: {btns}{group_warn}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ تأكيد وإرسال", callback_data="bc_go")],
@@ -504,7 +550,9 @@ async def _bc_confirm(msg, context):
 @admin_only
 async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    bc = context.user_data["bc"]
+    bc = context.user_data.pop("bc", None)
+    if not bc:
+        return MENU
     mtype_map = {"none": MediaType.NONE, "photo": MediaType.PHOTO, "video": MediaType.VIDEO,
                  "audio": MediaType.AUDIO, "document": MediaType.DOCUMENT}
     dest_mode = DestructMode.AFTER_TIME if bc.get("destruct", 0) > 0 else DestructMode.NEVER
@@ -532,16 +580,15 @@ async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_now:
         await q.message.edit_text("⏳ <b>بدأ البث في الخلفية...</b>", parse_mode="HTML")
         asyncio.create_task(
-            _run_broadcast_task(context.bot, update.effective_chat.id, msg_id, target, _menu_kb())
+            _run_broadcast_task(context.bot, update.effective_chat.id, msg_id, target, _menu_kb(update.effective_user.id))
         )
     else:
         with get_session() as session:
             db.update_message_status(session, msg_id, MessageStatus.SCHEDULED)
         sched.schedule_broadcast(context.bot, msg_id,
                                  run_at=bc.get("sched_at"), interval_hours=bc.get("interval"), target=target)
-        await q.message.edit_text(f"✅ جُدولت الرسالة #{msg_id}", reply_markup=_menu_kb())
+        await q.message.edit_text(f"✅ جُدولت الرسالة #{msg_id}", reply_markup=_menu_kb(update.effective_user.id))
 
-    context.user_data.clear()
     return MENU
 
 
@@ -549,44 +596,76 @@ async def bc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MANAGE MESSAGES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _manage_list(q):
+async def _manage_list(q, page: int = 0):
+    page = max(0, page)
     with get_session() as session:
-        raw = db.get_all_messages(session)
-        msgs = [{"id": m.id, "status": m.status.value, "is_paid": m.is_paid,
-                 "media": m.media_type.value, "created": m.created_at.strftime("%m-%d %H:%M")} for m in raw[:10]]
-    if not msgs:
+        raw, total = db.get_messages_paginated(session, page=page, per_page=MANAGE_PER_PAGE)
+        msgs = [
+            {
+                "id": m.id, "status": m.status.value, "is_paid": m.is_paid,
+                "created": m.created_at.strftime("%m-%d %H:%M"),
+            }
+            for m in raw
+        ]
+    if not msgs and page == 0:
         await q.message.reply_text("📭 لا توجد رسائل.", reply_markup=_back())
         return MENU
+
+    total_pages = max(1, (total + MANAGE_PER_PAGE - 1) // MANAGE_PER_PAGE)
     icons = {"draft": "📝", "scheduled": "⏰", "sent": "✅", "cancelled": "❌"}
     rows = [[InlineKeyboardButton(
-        f"{icons.get(m['status'],'❓')}{'💰' if m['is_paid'] else '🆓'} #{m['id']} {m['created']}",
-        callback_data=f"mgr_{m['id']}")] for m in msgs]
+        f"{icons.get(m['status'], '❓')}{'💰' if m['is_paid'] else '🆓'} #{m['id']} {m['created']}",
+        callback_data=f"mgr_{m['id']}"
+    )] for m in msgs]
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"mgp_{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"mgp_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="go_menu")])
-    await q.message.reply_text("📋 <b>الرسائل:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    txt = f"📋 <b>الرسائل ({total}) — صفحة {page + 1}/{total_pages}:</b>"
+    try:
+        await q.message.edit_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
     return MANAGE_LIST
 
 
 @admin_only
 async def manage_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "go_menu": return await cmd_admin(update, context)
+    if q.data == "go_menu":
+        return await cmd_admin(update, context)
+    if q.data.startswith("mgp_"):
+        return await _manage_list(q, page=int(q.data.split("_")[1]))
+
     mid = int(q.data.split("_")[1])
     with get_session() as session:
         m = db.get_message_by_id(session, mid)
         if not m:
             await q.message.reply_text("❌ غير موجودة", reply_markup=_back())
             return MENU
-        d = {"id": m.id, "status": m.status.value, "paid": m.is_paid,
-             "stars": m.stars_price, "media": m.media_type.value,
-             "protect": m.protect_content, "dest": m.destruct_seconds,
-             "created": m.created_at.strftime("%Y-%m-%d %H:%M")}
+        d = {
+            "id": m.id, "status": m.status.value, "paid": m.is_paid,
+            "stars": m.stars_price, "media": m.media_type.value,
+            "protect": m.protect_content, "dest": m.destruct_seconds,
+            "target": getattr(m, "target", "users") or "users",
+            "created": m.created_at.strftime("%Y-%m-%d %H:%M"),
+        }
     paid = f"💰 {d['stars']}⭐" if d["paid"] else "🆓"
     await q.message.edit_text(
-        f"📨 <b>#{d['id']}</b>\n{d['media']} | {paid} | 🔒{'✅' if d['protect'] else '❌'}\n💣 {d['dest']}ث | {d['status']} | {d['created']}",
+        f"📨 <b>#{d['id']}</b>\n{d['media']} | {paid} | 🔒{'✅' if d['protect'] else '❌'}\n"
+        f"💣 {d['dest']}ث | 📡 {d['target']} | {d['status']} | {d['created']}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 إرسال", callback_data=f"send_{mid}"),
-             InlineKeyboardButton("🗑️ حذف", callback_data=f"del_{mid}")],
+            [InlineKeyboardButton("📤 للمشتركين", callback_data=f"sendu_{mid}"),
+             InlineKeyboardButton("💬 للمجموعات", callback_data=f"sendg_{mid}"),
+             InlineKeyboardButton("🌐 للكل",      callback_data=f"senda_{mid}")],
+            [InlineKeyboardButton("🗑️ حذف", callback_data=f"del_{mid}")],
             [InlineKeyboardButton("🔙 القائمة", callback_data="go_manage")],
         ]),
     )
@@ -596,14 +675,19 @@ async def manage_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "go_manage": return await _manage_list(q)
-    if q.data == "go_menu": return await cmd_admin(update, context)
-    action, mid = q.data.split("_")[0], int(q.data.split("_")[1])
-    if action == "send":
-        with get_session() as session:
-            m_obj = db.get_message_by_id(session, mid)
-            target = (getattr(m_obj, "target", "users") or "users") if m_obj else "users"
-        await q.message.edit_text("⏳ <b>بدأ البث في الخلفية...</b>", parse_mode="HTML")
+    if q.data == "go_manage":
+        return await _manage_list(q, page=0)
+    if q.data == "go_menu":
+        return await cmd_admin(update, context)
+    action, mid_str = q.data.split("_", 1)
+    mid = int(mid_str)
+    target_map = {"sendu": "users", "sendg": "groups", "senda": "all"}
+    if action in target_map:
+        target = target_map[action]
+        await q.message.edit_text(
+            f"⏳ بدأ البث في الخلفية للرسالة #{mid} ({target})...",
+            reply_markup=_back("go_manage"),
+        )
         asyncio.create_task(
             _run_broadcast_task(context.bot, update.effective_chat.id, mid, target, _back("go_manage"))
         )
@@ -624,12 +708,10 @@ async def _stats(q):
         uc = db.get_user_count(session)
         gc = db.get_group_count(session)
         stars = db.get_total_stars_earned(session)
-        msgs = db.get_all_messages(session)
-        sent = sum(1 for m in msgs if m.status == MessageStatus.SENT)
-        schd = sum(1 for m in msgs if m.status == MessageStatus.SCHEDULED)
+        mstats = db.get_message_stats(session)
     await q.message.reply_text(
         f"📊 <b>الإحصائيات</b>\n\n👥 مشتركون: {uc}\n💬 مجموعات: {gc}\n"
-        f"⭐ نجوم: {stars}\n📨 مُرسلة: {sent}\n⏰ مجدولة: {schd}",
+        f"⭐ نجوم: {stars}\n📨 مُرسلة: {mstats['sent']}\n⏰ مجدولة: {mstats['scheduled']}",
         parse_mode="HTML", reply_markup=_back(),
     )
     return MENU
@@ -709,7 +791,7 @@ async def wel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["protect_content"] = not cfg["protect_content"]
             await q.message.edit_reply_markup(reply_markup=_wel_kb(cfg))
         elif d == "w_content":
-            context.user_data["_wel_media"] = []
+            context.user_data["_wel_draft"] = {"text": None, "text_changed": False, "media": []}
             await q.message.reply_text(
                 "📝 <b>أرسل نص رسالة الترحيب الجديد:</b>\n\n<i>أو اضغط تخطي.</i>",
                 parse_mode="HTML",
@@ -767,14 +849,15 @@ async def wel_btn_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def wel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: receive welcome text or skip."""
+    """Step 1: receive welcome text or skip — deferred save via _wel_draft."""
+    draft = context.user_data.setdefault("_wel_draft", {"text": None, "text_changed": False, "media": []})
     if update.callback_query:
         await update.callback_query.answer()
         if update.callback_query.data == "wel_skip_text":
             return await _wel_ask_media(update.callback_query.message)
         return WEL_TEXT
-    with get_session() as session:
-        db.save_welcome_config(session, text=update.message.text or "")
+    draft["text"] = update.message.text or ""
+    draft["text_changed"] = True
     return await _wel_ask_media(update.message)
 
 
@@ -795,17 +878,19 @@ async def _wel_ask_media(msg):
 
 @admin_only
 async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: collect media items or done/skip."""
+    """Step 2: collect media items or done/skip — deferred save via _wel_draft."""
+    draft = context.user_data.setdefault("_wel_draft", {"text": None, "text_changed": False, "media": []})
     if update.callback_query:
         await update.callback_query.answer()
         d = update.callback_query.data
         if d in ("wel_media_done", "wel_media_skip"):
-            ml = context.user_data.get("_wel_media", [])
-            if d == "wel_media_skip":
-                ml = []
+            ml = [] if d == "wel_media_skip" else draft["media"]
+            updates = {"media_list": ml}
+            if draft["text_changed"]:
+                updates["text"] = draft["text"]
             with get_session() as session:
-                db.save_welcome_config(session, media_list=ml)
-            context.user_data.pop("_wel_media", None)
+                db.save_welcome_config(session, **updates)
+            context.user_data.pop("_wel_draft", None)
             await update.callback_query.message.reply_text("✅ تم التحديث.", reply_markup=_back("m_welcome"))
             return MENU
         return WEL_MEDIA
@@ -824,9 +909,7 @@ async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"type": "document", "file_id": m.document.file_id}
 
     if item:
-        if "_wel_media" not in context.user_data:
-            context.user_data["_wel_media"] = []
-        if len(context.user_data["_wel_media"]) >= MAX_MEDIA_ITEMS:
+        if len(draft["media"]) >= MAX_MEDIA_ITEMS:
             await m.reply_text(
                 f"⚠️ الحد الأقصى {MAX_MEDIA_ITEMS} وسائط. اضغط ✅ انتهيت.",
                 reply_markup=InlineKeyboardMarkup([
@@ -834,13 +917,13 @@ async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
             return WEL_MEDIA
-        context.user_data["_wel_media"].append(item)
-        if m.caption:
-            with get_session() as session:
-                db.save_welcome_config(session, text=m.caption)
-        n = len(context.user_data["_wel_media"])
+        draft["media"].append(item)
+        if m.caption and not draft["text_changed"]:
+            draft["text"] = m.caption
+            draft["text_changed"] = True
+        n = len(draft["media"])
         await m.reply_text(
-            f"✅ تم إضافة ({n}) وسائط. أرسل المزيد أو اضغط انتهيت.",
+            f"✅ تم إضافة ({n}/{MAX_MEDIA_ITEMS}) وسائط. أرسل المزيد أو اضغط انتهيت.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ انتهيت", callback_data="wel_media_done")],
                 [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
@@ -854,7 +937,7 @@ async def wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def wel_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: s = int(update.message.text.strip()); assert s >= 0
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ رقم ≥ 0", reply_markup=CXL); return WEL_DESTRUCT
     with get_session() as session:
         db.save_welcome_config(session, destruct_seconds=s)
@@ -872,8 +955,8 @@ async def wel_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def wel_btn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ يجب http", reply_markup=CXL); return WEL_BTN_URL
+    if not _is_valid_url(url):
+        await update.message.reply_text("❌ رابط غير صالح. مثال: https://example.com", reply_markup=CXL); return WEL_BTN_URL
     name = context.user_data.pop("_btn", "زر")
     with get_session() as session:
         cfg = db.get_welcome_config(session)
@@ -945,7 +1028,7 @@ async def sm_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text("⭐ أرسل السعر بالنجوم:", reply_markup=CXL)
                 return SM_PRICE
         elif d == "s_content":
-            context.user_data["_sm_media"] = []
+            context.user_data["_sm_draft"] = {"text": None, "text_changed": False, "media": []}
             await q.message.reply_text(
                 "📝 <b>أرسل وصف المحتوى الجديد:</b>\n\n<i>أو اضغط تخطي.</i>",
                 parse_mode="HTML",
@@ -1002,16 +1085,15 @@ async def sm_btn_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def sm_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: receive text or skip."""
+    """Step 1: receive text or skip — deferred save via _sm_draft."""
+    draft = context.user_data.setdefault("_sm_draft", {"text": None, "text_changed": False, "media": []})
     if update.callback_query:
         await update.callback_query.answer()
         if update.callback_query.data == "sm_skip_text":
-            # Don't change existing text
             return await _sm_ask_media(update.callback_query.message)
         return SM_TEXT
-    # Save text
-    with get_session() as session:
-        db.save_start_msg_config(session, text=update.message.text or "")
+    draft["text"] = update.message.text or ""
+    draft["text_changed"] = True
     return await _sm_ask_media(update.message)
 
 
@@ -1032,17 +1114,19 @@ async def _sm_ask_media(msg):
 
 @admin_only
 async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: collect media items or done/skip."""
+    """Step 2: collect media items or done/skip — deferred save via _sm_draft."""
+    draft = context.user_data.setdefault("_sm_draft", {"text": None, "text_changed": False, "media": []})
     if update.callback_query:
         await update.callback_query.answer()
         d = update.callback_query.data
         if d in ("sm_media_done", "sm_media_skip"):
-            ml = context.user_data.get("_sm_media", [])
-            if d == "sm_media_skip":
-                ml = []
+            ml = [] if d == "sm_media_skip" else draft["media"]
+            updates = {"media_list": ml}
+            if draft["text_changed"]:
+                updates["text"] = draft["text"]
             with get_session() as session:
-                db.save_start_msg_config(session, media_list=ml)
-            context.user_data.pop("_sm_media", None)
+                db.save_start_msg_config(session, **updates)
+            context.user_data.pop("_sm_draft", None)
             await update.callback_query.message.reply_text("✅ تم التحديث.", reply_markup=_back("m_startmsg"))
             return MENU
         return SM_MEDIA
@@ -1061,9 +1145,7 @@ async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"type": "document", "file_id": m.document.file_id}
 
     if item:
-        if "_sm_media" not in context.user_data:
-            context.user_data["_sm_media"] = []
-        if len(context.user_data["_sm_media"]) >= MAX_MEDIA_ITEMS:
+        if len(draft["media"]) >= MAX_MEDIA_ITEMS:
             await m.reply_text(
                 f"⚠️ الحد الأقصى {MAX_MEDIA_ITEMS} وسائط. اضغط ✅ انتهيت.",
                 reply_markup=InlineKeyboardMarkup([
@@ -1071,13 +1153,13 @@ async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
             return SM_MEDIA
-        context.user_data["_sm_media"].append(item)
-        if m.caption:
-            with get_session() as session:
-                db.save_start_msg_config(session, text=m.caption)
-        n = len(context.user_data["_sm_media"])
+        draft["media"].append(item)
+        if m.caption and not draft["text_changed"]:
+            draft["text"] = m.caption
+            draft["text_changed"] = True
+        n = len(draft["media"])
         await m.reply_text(
-            f"✅ تم إضافة ({n}) وسائط. أرسل المزيد أو اضغط انتهيت.",
+            f"✅ تم إضافة ({n}/{MAX_MEDIA_ITEMS}) وسائط. أرسل المزيد أو اضغط انتهيت.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ انتهيت", callback_data="sm_media_done")],
                 [InlineKeyboardButton("❌ إلغاء", callback_data="cxl")],
@@ -1091,7 +1173,7 @@ async def sm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def sm_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: s = int(update.message.text.strip()); assert s >= 0
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ رقم ≥ 0", reply_markup=CXL); return SM_DESTRUCT
     with get_session() as session:
         db.save_start_msg_config(session, destruct_seconds=s)
@@ -1102,7 +1184,7 @@ async def sm_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def sm_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: p = int(update.message.text.strip()); assert p >= 1
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ رقم > 0", reply_markup=CXL); return SM_PRICE
     with get_session() as session:
         db.save_start_msg_config(session, is_paid=True, stars_price=p)
@@ -1120,8 +1202,8 @@ async def sm_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def sm_btn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ يجب http", reply_markup=CXL); return SM_BTN_URL
+    if not _is_valid_url(url):
+        await update.message.reply_text("❌ رابط غير صالح. مثال: https://example.com", reply_markup=CXL); return SM_BTN_URL
     name = context.user_data.pop("_btn", "زر")
     with get_session() as session:
         cfg = db.get_start_msg_config(session)
@@ -1136,7 +1218,12 @@ async def sm_btn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN MANAGEMENT & BAN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _admins_menu(q, context):
+async def _admins_menu(update, context):
+    if not config.is_static_admin(update.effective_user.id):
+        if update.callback_query:
+            await update.callback_query.answer("🚫 للمشرف الرئيسي فقط.", show_alert=True)
+        return MENU
+    q = update.callback_query
     with get_session() as session:
         dyn = db.list_admins(session)
         dlist = [(a.telegram_id, a.note or "") for a in dyn]
@@ -1155,6 +1242,7 @@ async def _admins_menu(q, context):
 
 
 @admin_only
+@super_admin_only
 async def adm_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.data == "adm_add":
@@ -1167,16 +1255,17 @@ async def adm_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+@super_admin_only
 async def do_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split(maxsplit=1)
     try: tid = int(parts[0])
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ معرف غير صالح", reply_markup=CXL); return ADD_ADMIN
     note = parts[1] if len(parts) > 1 else ""
     with get_session() as session:
         ok = db.add_admin(session, tid, update.effective_user.id, note)
     txt = f"✅ أُضيف <code>{tid}</code>" if ok else f"⚠️ <code>{tid}</code> موجود"
-    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb())
+    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb(update.effective_user.id))
     if ok:
         try: await context.bot.send_message(tid, "👑 تمت ترقيتك مشرفاً! /admin")
         except: pass
@@ -1184,26 +1273,33 @@ async def do_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+@super_admin_only
 async def do_rem_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: tid = int(update.message.text.strip())
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ معرف غير صالح", reply_markup=CXL); return REM_ADMIN
-    if tid in config._STATIC_ADMIN_IDS:
-        await update.message.reply_text("⚠️ لا يمكن إزالة مشرف ثابت.", reply_markup=_menu_kb())
+    if config.is_static_admin(tid):
+        await update.message.reply_text("⚠️ لا يمكن إزالة مشرف ثابت.", reply_markup=_menu_kb(update.effective_user.id))
         return MENU
     with get_session() as session:
         ok = db.remove_admin(session, tid)
     txt = f"✅ أُزيل <code>{tid}</code>" if ok else "❌ غير موجود"
-    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb())
+    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_menu_kb(update.effective_user.id))
     return MENU
 
 
 @admin_only
 async def do_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: tid = int(update.message.text.strip())
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("❌ أدخل رقماً", reply_markup=CXL); return BAN_INPUT
     action = context.user_data.get("ban_action", "ban")
+    if action == "ban" and config.is_admin(tid):
+        await update.message.reply_text(
+            "⚠️ لا يمكن حظر مشرف. قم بإزالته من قائمة المشرفين أولاً.",
+            reply_markup=_menu_kb(update.effective_user.id),
+        )
+        return MENU
     with get_session() as session:
         if action == "ban":
             ok = db.ban_user(session, tid)
@@ -1222,6 +1318,15 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def stale_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gracefully handle clicks on old admin panel buttons after a bot restart."""
+    q = update.callback_query
+    if config.is_admin(update.effective_user.id):
+        await q.answer("🔄 انتهت الجلسة. أرسل /admin مجدداً.", show_alert=True)
+    else:
+        await q.answer("🚫 غير مصرح", show_alert=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # REGISTER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1231,7 +1336,7 @@ _any_media = filters.TEXT | filters.PHOTO | filters.VIDEO | filters.AUDIO | filt
 
 def register_admin_handlers(app):
     conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", cmd_admin)],
+        entry_points=[CommandHandler("admin", cmd_admin, filters=filters.ChatType.PRIVATE)],
         states={
             MENU: [
                 CallbackQueryHandler(menu_dispatch, pattern="^m_"),
@@ -1264,8 +1369,8 @@ def register_admin_handlers(app):
             BC_BTN_URL:       [MessageHandler(filters.TEXT & ~filters.COMMAND, bc_btn_url)] + _cxl,
             BC_CONFIRM:       [CallbackQueryHandler(bc_confirm, pattern="^bc_go$")] + _cxl,
             # Manage
-            MANAGE_LIST:   [CallbackQueryHandler(manage_detail, pattern="^(mgr_|go_)")] + _cxl,
-            MANAGE_DETAIL: [CallbackQueryHandler(manage_action, pattern="^(send_|del_|go_)")] + _cxl,
+            MANAGE_LIST:   [CallbackQueryHandler(manage_detail, pattern="^(mgr_\\d+|mgp_\\d+|go_)")] + _cxl,
+            MANAGE_DETAIL: [CallbackQueryHandler(manage_action, pattern="^(sendu_\\d+|sendg_\\d+|senda_\\d+|del_\\d+|go_)")] + _cxl,
             # Welcome
             WEL_PANEL: [
                 CallbackQueryHandler(wel_action, pattern="^w_"),
@@ -1316,3 +1421,10 @@ def register_admin_handlers(app):
         per_user=True, per_chat=True, allow_reentry=True,
     )
     app.add_handler(conv)
+    app.add_handler(
+        CallbackQueryHandler(
+            stale_admin_callback,
+            pattern=r"^(m_|go_|cxl$|adm_|w_|wba|wbd_|s_|sba|sbd_|bc_|tgt_|sch_|btn_|mgr_|mgp_|sendu_|sendg_|senda_|del_|inv_)",
+        ),
+        group=1,
+    )

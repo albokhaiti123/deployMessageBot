@@ -10,7 +10,7 @@ load_dotenv()
 # ─── Bot Settings ────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
-# Static admins from .env (always have access even if DB is unavailable)
+# Static admins from .env (super-admins: always have access even if DB is unavailable)
 _STATIC_ADMIN_IDS: list[int] = [
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
 ]
@@ -23,7 +23,6 @@ BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")   # without @
 INVITE_ONLY: bool = os.getenv("INVITE_ONLY", "true").lower() == "true"
 
 # ─── Stars Payment ───────────────────────────────────────────────────────────
-# MUST be empty string "" for Telegram Stars (XTR) — do NOT set a provider token
 STARS_PROVIDER_TOKEN: str = ""
 
 # ─── Scheduler ───────────────────────────────────────────────────────────────
@@ -33,12 +32,13 @@ SCHEDULER_TIMEZONE: str = os.getenv("SCHEDULER_TIMEZONE", "Asia/Riyadh")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 
-# ─── Dynamic admin check (merges .env + DB) ──────────────────────────────────
+def is_static_admin(telegram_id: int) -> bool:
+    """Returns True if telegram_id is a static (super) admin defined in .env."""
+    return telegram_id in _STATIC_ADMIN_IDS
+
+
 def is_admin(telegram_id: int) -> bool:
-    """
-    Returns True if telegram_id is a bot admin.
-    Checks static list first (fast), then queries DB for dynamic admins.
-    """
+    """Returns True if telegram_id is either a static or dynamic bot admin."""
     if telegram_id in _STATIC_ADMIN_IDS:
         return True
     try:
@@ -63,5 +63,4 @@ def get_all_admin_ids() -> list[int]:
         return list(_STATIC_ADMIN_IDS)
 
 
-# Keep for backward compat (used in notification loops)
 ADMIN_IDS: list[int] = _STATIC_ADMIN_IDS

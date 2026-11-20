@@ -7,13 +7,18 @@ Phase-1 fixes:
   - MessageView: ondelete CASCADE on message_id
   - MediaType: added VOICE
   - _run_phase1_migrations(): safe ALTER for existing DBs
+Phase-2 fixes:
+  - utcnow_naive(): timezone-safe replacement for deprecated datetime.utcnow()
+  - SQLite WAL/pragma listener
+  - Performance indexes on Purchase and SelfDestructJob
+  - _run_phase2_indexes(): safe index creation for pre-existing databases
 """
 import datetime
 import enum
 import logging
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Text,
-    Boolean, DateTime, Float, ForeignKey, Enum as SAEnum, inspect, text
+    create_engine, event, Column, Integer, BigInteger, String, Text,
+    Boolean, DateTime, Float, ForeignKey, Enum as SAEnum, Index, inspect, text
 )
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
@@ -21,11 +26,28 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+def utcnow_naive() -> datetime.datetime:
+    """Timezone-safe replacement for deprecated datetime.utcnow()."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 engine = create_engine(
     config.DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in config.DATABASE_URL else {},
     echo=False,
 )
+
+if "sqlite" in config.DATABASE_URL:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
@@ -71,8 +93,8 @@ class User(Base):
     is_active         = Column(Boolean, default=True)
     is_banned         = Column(Boolean, default=False)
     referred_by       = Column(BigInteger, nullable=True)
-    joined_at         = Column(DateTime, default=datetime.datetime.utcnow)
-    last_seen         = Column(DateTime, default=datetime.datetime.utcnow)
+    joined_at         = Column(DateTime, default=utcnow_naive)
+    last_seen         = Column(DateTime, default=utcnow_naive)
     start_msg_shown   = Column(Boolean, default=False)
     # FIX: was BigInteger — now Text to store JSON list like "[101, 102]"
     last_start_msg_id = Column(Text, nullable=True)
@@ -106,7 +128,7 @@ class BroadcastMessage(Base):
     scheduled_at     = Column(DateTime, nullable=True)
     interval_hours   = Column(Float, nullable=True)
     sent_at          = Column(DateTime, nullable=True)
-    created_at       = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at       = Column(DateTime, default=utcnow_naive)
     created_by       = Column(BigInteger, nullable=False)
     buttons_json     = Column(Text, default="[]")
     media_json       = Column(Text, default="[]")
@@ -121,6 +143,9 @@ class BroadcastMessage(Base):
 class Purchase(Base):
     """Records a Stars payment for a paid broadcast or /start message."""
     __tablename__ = "purchases"
+    __table_args__ = (
+        Index("ix_purchases_user_type_msg", "user_id", "purchase_type", "message_id"),
+    )
 
     id                         = Column(Integer, primary_key=True, autoincrement=True)
     user_id                    = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -134,7 +159,7 @@ class Purchase(Base):
     purchase_type              = Column(String(32), default="broadcast", nullable=False)
     stars_paid                 = Column(Integer, nullable=False)
     telegram_payment_charge_id = Column(String(256), nullable=True)
-    purchased_at               = Column(DateTime, default=datetime.datetime.utcnow)
+    purchased_at               = Column(DateTime, default=utcnow_naive)
 
     user    = relationship("User", back_populates="purchases")
     message = relationship("BroadcastMessage", back_populates="purchases")
@@ -155,7 +180,7 @@ class MessageView(Base):
         nullable=False,
     )
     sent_msg_id = Column(BigInteger, nullable=True)
-    viewed_at   = Column(DateTime, default=datetime.datetime.utcnow)
+    viewed_at   = Column(DateTime, default=utcnow_naive)
     deleted_at  = Column(DateTime, nullable=True)
 
     user    = relationship("User", back_populates="viewed_messages")
@@ -171,7 +196,7 @@ class InviteLink(Base):
     owner_id   = Column(BigInteger, nullable=False)
     token      = Column(String(64), unique=True, nullable=False)
     uses       = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow_naive)
 
 
 # ─── BotGroup ─────────────────────────────────────────────────────────────────
@@ -184,8 +209,8 @@ class BotGroup(Base):
     title     = Column(String(256), nullable=True)
     username  = Column(String(64), nullable=True)
     is_active = Column(Boolean, default=True)
-    added_at  = Column(DateTime, default=datetime.datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.datetime.utcnow)
+    added_at  = Column(DateTime, default=utcnow_naive)
+    last_seen = Column(DateTime, default=utcnow_naive)
 
 
 # ─── BotSettings ──────────────────────────────────────────────────────────────
@@ -196,8 +221,8 @@ class BotSettings(Base):
     id         = Column(Integer, primary_key=True, autoincrement=True)
     key        = Column(String(128), unique=True, nullable=False)
     value      = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
-                        onupdate=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow_naive,
+                        onupdate=utcnow_naive)
 
 
 # ─── AdminUser ────────────────────────────────────────────────────────────────
@@ -208,7 +233,7 @@ class AdminUser(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     telegram_id = Column(BigInteger, unique=True, nullable=False)
     added_by    = Column(BigInteger, nullable=False)
-    added_at    = Column(DateTime, default=datetime.datetime.utcnow)
+    added_at    = Column(DateTime, default=utcnow_naive)
     note        = Column(String(256), nullable=True)
 
 
@@ -251,13 +276,17 @@ class StartMessageConfig(Base):
 
 class SelfDestructJob(Base):
     __tablename__ = "self_destruct_jobs"
+    __table_args__ = (
+        Index("ix_destruct_deleted_at", "deleted", "delete_at"),
+        Index("ix_destruct_chat_msg", "chat_id", "message_id"),
+    )
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
     chat_id    = Column(BigInteger, nullable=False)
     message_id = Column(BigInteger, nullable=False)
     delete_at  = Column(DateTime, nullable=False)
     deleted    = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow_naive)
 
 
 # ─── Safe Phase-1 Schema Migration ───────────────────────────────────────────
@@ -342,11 +371,29 @@ def _run_phase1_migrations():
                     pass
 
 
+# ─── Phase-2 Index Migration ──────────────────────────────────────────────────
+
+def _run_phase2_indexes():
+    """Ensure Phase 2 performance indexes exist on pre-existing databases."""
+    statements = [
+        "CREATE INDEX IF NOT EXISTS ix_purchases_user_type_msg ON purchases (user_id, purchase_type, message_id)",
+        "CREATE INDEX IF NOT EXISTS ix_destruct_deleted_at ON self_destruct_jobs (deleted, delete_at)",
+        "CREATE INDEX IF NOT EXISTS ix_destruct_chat_msg ON self_destruct_jobs (chat_id, message_id)",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            try:
+                conn.execute(text(stmt))
+            except Exception as e:
+                logger.debug(f"Index check skipped ({stmt}): {e}")
+
+
 # ─── Init ─────────────────────────────────────────────────────────────────────
 
 def init_db():
     Base.metadata.create_all(engine)
     _run_phase1_migrations()
+    _run_phase2_indexes()
 
 
 def get_session():

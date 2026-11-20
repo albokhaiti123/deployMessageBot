@@ -1,5 +1,12 @@
-python-telegram-bot[job-queue]==21.6
+python-telegram-bot==21.6
 APScheduler==3.10.4
 SQLAlchemy==2.0.35
 python-dotenv==1.0.1
-pytz==2024.1
+tzdata==2024.2
+
+# PostgreSQL driver (uncomment when using DATABASE_URL=postgresql://...)
+# psycopg2-binary==2.9.9
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0

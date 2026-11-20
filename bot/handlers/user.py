@@ -13,7 +13,7 @@ Phase-1 fixes:
 import html
 import logging
 from telegram import Update, InlineKeyboardButton
-from telegram.ext import ContextTypes, CommandHandler, ChatMemberHandler
+from telegram.ext import ContextTypes, CommandHandler, ChatMemberHandler, filters
 
 import config
 from database.models import get_session
@@ -301,6 +301,6 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
 # ─── Register ─────────────────────────────────────────────────────────────────
 
 def register_user_handlers(app):
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help",  help_cmd))
+    app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("help",  help_cmd, filters=filters.ChatType.PRIVATE))
     app.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))

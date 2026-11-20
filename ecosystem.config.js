@@ -3,15 +3,16 @@ module.exports = {
     {
       name: "deploy-msg-bot",
       script: "main.py",
-      interpreter: "python",
-      // interpreter: "python3",  // uncomment on Linux/macOS
+      interpreter: "./venv/bin/python",
+      // On Windows use: interpreter: "venv\\Scripts\\python.exe",
       watch: false,
       autorestart: true,
       max_restarts: 10,
-      restart_delay: 5000,       // 5 seconds between restarts
+      restart_delay: 5000,
+      max_memory_restart: "512M",
       env: {
         NODE_ENV: "production",
-        PYTHONUNBUFFERED: "1",   // ensures logs appear in real-time
+        PYTHONUNBUFFERED: "1",
       },
       log_date_format: "YYYY-MM-DD HH:mm:ss",
       out_file: "logs/pm2_out.log",

@@ -122,12 +122,33 @@ async def _cleanup_job(bot):
 def schedule_cleanup(bot):
     scheduler.add_job(
         _cleanup_job,
-        trigger=IntervalTrigger(seconds=30, timezone=get_scheduler_tz()),
+        trigger=IntervalTrigger(seconds=15, timezone=get_scheduler_tz()),
         id="cleanup_expired",
         args=[bot],
+        max_instances=1,
+        coalesce=True,
         replace_existing=True,
     )
-    logger.info("Cleanup job scheduled every 30s.")
+    logger.info("Cleanup job scheduled every 15s.")
+
+
+async def _purge_job():
+    with get_session() as session:
+        removed = db.purge_old_destruct_jobs(session, older_than_days=7)
+    if removed:
+        logger.info(f"Purged {removed} old SelfDestructJob records.")
+
+
+def schedule_purge():
+    scheduler.add_job(
+        _purge_job,
+        trigger=IntervalTrigger(hours=24, timezone=get_scheduler_tz()),
+        id="purge_old_destruct_jobs",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    logger.info("Daily SelfDestructJob purge scheduled.")
 
 
 # ─── Restore on startup ───────────────────────────────────────────────────────
